@@ -782,6 +782,45 @@ impl IndexMerger {
         serializer.close()?;
         Ok(self.max_doc)
     }
+
+    /// Writes the merged index with a custom document ID mapping.
+    /// This allows for custom ordering of documents in the merged segment.
+    ///
+    /// # Arguments
+    /// * `serializer` - The segment serializer to write the merged data to
+    /// * `custom_doc_id_mapping` - Custom mapping from new doc IDs to old doc addresses
+    ///
+    /// # Returns
+    /// The number of documents in the resulting segment.
+    pub fn write_with_custom_mapping(
+        &self,
+        mut serializer: SegmentSerializer,
+        custom_doc_id_mapping: SegmentDocIdMapping,
+    ) -> crate::Result<u32> {
+        debug!("write-fieldnorms");
+        if let Some(fieldnorms_serializer) = serializer.extract_fieldnorms_serializer() {
+            self.write_fieldnorms(fieldnorms_serializer, &custom_doc_id_mapping)?;
+        }
+        debug!("write-postings");
+        let fieldnorm_data = serializer
+            .segment()
+            .open_read(SegmentComponent::FieldNorms)?;
+        let fieldnorm_readers = FieldNormReaders::open(fieldnorm_data)?;
+        self.write_postings(
+            serializer.get_postings_serializer(),
+            fieldnorm_readers,
+            &custom_doc_id_mapping,
+        )?;
+
+        debug!("write-storagefields");
+        self.write_storable_fields(serializer.get_store_writer(), &custom_doc_id_mapping)?;
+        debug!("write-fastfields");
+        self.write_fast_fields(serializer.get_fast_field_write(), custom_doc_id_mapping)?;
+
+        debug!("close-serializer");
+        serializer.close()?;
+        Ok(self.max_doc)
+    }
 }
 
 #[cfg(test)]

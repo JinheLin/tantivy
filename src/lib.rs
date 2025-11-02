@@ -166,7 +166,7 @@ mod future_result;
 
 // Re-exports
 pub use common::DateTime;
-pub use {columnar, query_grammar, time};
+pub use {columnar, common, query_grammar, time};
 
 pub use crate::error::TantivyError;
 pub use crate::future_result::FutureResult;
