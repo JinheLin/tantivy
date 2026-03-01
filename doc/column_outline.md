@@ -31,7 +31,7 @@
 - [ ] P1-01 从示例理解 Tantivy 的最小闭环（Index → Writer → commit → Reader/Searcher → Query → Collector）→ `doc/column/第1部分-入门与全景/01-最小闭环.md`
 - [ ] P1-02 Index/Segment/Meta：不可变分段模型与 meta.json → `doc/column/第1部分-入门与全景/02-Index与Segment与meta.json.md`
 - [ ] P1-03 Directory 与 mmap：I/O 抽象与“把缓存交给 OS” → `doc/column/第1部分-入门与全景/03-Directory与mmap.md`
-- [ ] P1-04 Schema/Document/Term：数据模型如何决定索引结构 → `doc/column/第1部分-入门与全景/04-Schema与Document与Term.md`
+- [x] P1-04 Schema/Document/Term：数据模型如何决定索引结构 → `doc/column/第1部分-入门与全景/04-Schema与Document与Term.md`
 
 ### 第 2 部分｜写入管线：从文档到段文件（4 篇）
 
@@ -65,7 +65,7 @@
 >>>>>>> 68c15cbb (Codex changes)
 | P1-02 | Index/Segment/Meta | TODO |  |  |
 | P1-03 | Directory/mmap | TODO |  |  |
-| P1-04 | Schema/Document/Term | TODO |  |  |
+| P1-04 | Schema/Document/Term | DRAFT |  | 含可运行示例：`examples/p1_04_schema_doc_term.rs` |
 | P2-05 | Tokenizer | TODO |  |  |
 | P2-06 | 倒排总览 | TODO |  |  |
 | P2-07 | Postings/Positions/FieldNorm | TODO |  |  |
