@@ -1,6 +1,10 @@
 # Tantivy 源码解析专栏（可执行大纲）
 
+<<<<<<< HEAD
 > 版本基线：本仓库 `tantivy 0.24.0`（见 `Cargo.toml`）
+=======
+> 版本基线：本仓库 `tantivy 0.26.0`（见 `Cargo.toml`）
+>>>>>>> 68c15cbb (Codex changes)
 >
 > 写作目标：读者能“跑起来、看得懂、改得动”——每篇文章都要有可复现实验与源码入口。
 
@@ -54,7 +58,11 @@
 
 | ID | 标题 | 状态 | 预计发布日期 | 备注 |
 |---|---|---|---|---|
+<<<<<<< HEAD
 | P1-01 | 最小闭环 | DRAFT |  |  |
+=======
+| P1-01 | 最小闭环 | TODO |  |  |
+>>>>>>> 68c15cbb (Codex changes)
 | P1-02 | Index/Segment/Meta | TODO |  |  |
 | P1-03 | Directory/mmap | TODO |  |  |
 | P1-04 | Schema/Document/Term | TODO |  |  |
@@ -70,3 +78,7 @@
 | P4-14 | Deletes/AliveBitset | TODO |  |  |
 | P4-15 | MergePolicy/Merge | TODO |  |  |
 | P4-16 | 收官专题 | TODO |  |  |
+<<<<<<< HEAD
+=======
+
+>>>>>>> 68c15cbb (Codex changes)
