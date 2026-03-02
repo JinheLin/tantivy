@@ -2,7 +2,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use columnar::{ColumnValues, StrColumn};
+use columnar::{BytesColumn, ColumnValues, StrColumn};
 use serde::{Deserialize, Serialize};
 
 use super::Collector;
@@ -83,6 +83,155 @@ where
             })
             .collect::<Vec<_>>();
         Ok(transformed_result)
+    }
+}
+
+struct BytesConvertCollector {
+    pub collector: CustomScoreTopCollector<ScorerByField, u64>,
+    pub field: String,
+    order: Order,
+    limit: usize,
+    offset: usize,
+}
+
+impl Collector for BytesConvertCollector {
+    type Fruit = Vec<(Vec<u8>, DocAddress)>;
+
+    type Child = BytesConvertSegmentCollector;
+
+    fn for_segment(
+        &self,
+        segment_local_id: crate::SegmentOrdinal,
+        segment: &SegmentReader,
+    ) -> crate::Result<Self::Child> {
+        let schema = segment.schema();
+        let field = schema.get_field(&self.field)?;
+        let field_entry = schema.get_field_entry(field);
+        if !field_entry.is_fast() {
+            return Err(TantivyError::SchemaError(format!(
+                "Field {:?} is not a fast field.",
+                field_entry.name()
+            )));
+        }
+        let requested_type = crate::schema::Type::Bytes;
+        let schema_type = field_entry.field_type().value_type();
+        if schema_type != requested_type {
+            return Err(TantivyError::SchemaError(format!(
+                "Field {:?} is of type {schema_type:?}!={requested_type:?}",
+                field_entry.name()
+            )));
+        }
+        let ff = segment
+            .fast_fields()
+            .bytes(&self.field)?
+            .expect("ff should be a bytes field");
+        Ok(BytesConvertSegmentCollector {
+            collector: self.collector.for_segment(segment_local_id, segment)?,
+            ff,
+            order: self.order.clone(),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        self.collector.requires_scoring()
+    }
+
+    fn merge_fruits(
+        &self,
+        child_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
+    ) -> crate::Result<Self::Fruit> {
+        if self.limit == 0 {
+            return Ok(Vec::new());
+        }
+        if self.order.is_desc() {
+            let mut top_collector: TopNComputer<_, _, true> =
+                TopNComputer::new(self.limit + self.offset);
+            for child_fruit in child_fruits {
+                for (feature, doc) in child_fruit {
+                    top_collector.push(feature, doc);
+                }
+            }
+            Ok(top_collector
+                .into_sorted_vec()
+                .into_iter()
+                .skip(self.offset)
+                .map(|cdoc| (cdoc.feature, cdoc.doc))
+                .collect())
+        } else {
+            let mut top_collector: TopNComputer<_, _, false> =
+                TopNComputer::new(self.limit + self.offset);
+            for child_fruit in child_fruits {
+                for (feature, doc) in child_fruit {
+                    top_collector.push(feature, doc);
+                }
+            }
+
+            Ok(top_collector
+                .into_sorted_vec()
+                .into_iter()
+                .skip(self.offset)
+                .map(|cdoc| (cdoc.feature, cdoc.doc))
+                .collect())
+        }
+    }
+}
+
+struct BytesConvertSegmentCollector {
+    pub collector: CustomScoreTopSegmentCollector<ScorerByFastFieldReader, u64>,
+    ff: BytesColumn,
+    order: Order,
+}
+
+impl SegmentCollector for BytesConvertSegmentCollector {
+    type Fruit = Vec<(Vec<u8>, DocAddress)>;
+
+    fn collect(&mut self, doc: DocId, score: Score) {
+        self.collector.collect(doc, score);
+    }
+
+    fn harvest(self) -> Vec<(Vec<u8>, DocAddress)> {
+        let top_ordinals: Vec<(TermOrdinal, DocAddress)> = self.collector.harvest();
+
+        // Collect terms.
+        let mut terms: Vec<Vec<u8>> = Vec::with_capacity(top_ordinals.len());
+        let result = if self.order.is_asc() {
+            self.ff.dictionary().sorted_ords_to_term_cb(
+                top_ordinals.iter().map(|(term_ord, _)| u64::MAX - term_ord),
+                |term| {
+                    terms.push(term.to_vec());
+                    Ok(())
+                },
+            )
+        } else {
+            self.ff.dictionary().sorted_ords_to_term_cb(
+                top_ordinals.iter().rev().map(|(term_ord, _)| *term_ord),
+                |term| {
+                    terms.push(term.to_vec());
+                    Ok(())
+                },
+            )
+        };
+
+        assert!(
+            result.expect("Failed to read terms from term dictionary"),
+            "Not all terms were matched in segment."
+        );
+
+        // Zip them back with their docs.
+        if self.order.is_asc() {
+            terms
+                .into_iter()
+                .zip(top_ordinals)
+                .map(|(term, (_, doc))| (term, doc))
+                .collect()
+        } else {
+            terms
+                .into_iter()
+                .rev()
+                .zip(top_ordinals)
+                .map(|(term, (_, doc))| (term, doc))
+                .collect()
+        }
     }
 }
 
@@ -567,6 +716,30 @@ impl TopDocs {
             field: fast_field.to_string(),
             fast_value: PhantomData,
             order,
+        }
+    }
+
+    /// Like `order_by_fast_field`, but for a `Bytes` fast field.
+    pub fn order_by_bytes_fast_field(
+        self,
+        fast_field: impl ToString,
+        order: Order,
+    ) -> impl Collector<Fruit = Vec<(Vec<u8>, DocAddress)>> {
+        let limit = self.0.limit;
+        let offset = self.0.offset;
+        let u64_collector = CustomScoreTopCollector::new(
+            ScorerByField {
+                field: fast_field.to_string(),
+                order: order.clone(),
+            },
+            self.0.into_tscore(),
+        );
+        BytesConvertCollector {
+            collector: u64_collector,
+            field: fast_field.to_string(),
+            order,
+            limit,
+            offset,
         }
     }
 
@@ -1743,6 +1916,163 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_top_field_collector_bytes() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let bytes = schema_builder.add_bytes_field("bytes", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_for_tests()?;
+        index_writer.add_document(doc!(
+                bytes => b"austin".to_vec(),
+        ))?;
+        index_writer.add_document(doc!(
+                bytes => b"greenville".to_vec(),
+        ))?;
+        index_writer.add_document(doc!(
+            bytes => b"tokyo".to_vec(),
+        ))?;
+        index_writer.commit()?;
+
+        fn query(
+            index: &Index,
+            order: Order,
+            limit: usize,
+            offset: usize,
+        ) -> crate::Result<Vec<(Vec<u8>, DocAddress)>> {
+            let searcher = index.reader()?.searcher();
+            let top_collector = TopDocs::with_limit(limit)
+                .and_offset(offset)
+                .order_by_bytes_fast_field("bytes", order);
+            searcher.search(&AllQuery, &top_collector)
+        }
+
+        assert_eq!(
+            &query(&index, Order::Desc, 3, 0)?,
+            &[
+                (b"tokyo".to_vec(), DocAddress::new(0, 2)),
+                (b"greenville".to_vec(), DocAddress::new(0, 1)),
+                (b"austin".to_vec(), DocAddress::new(0, 0)),
+            ]
+        );
+
+        assert_eq!(
+            &query(&index, Order::Desc, 2, 0)?,
+            &[
+                (b"tokyo".to_vec(), DocAddress::new(0, 2)),
+                (b"greenville".to_vec(), DocAddress::new(0, 1)),
+            ]
+        );
+
+        assert_eq!(&query(&index, Order::Desc, 3, 3)?, &[]);
+
+        assert_eq!(
+            &query(&index, Order::Desc, 2, 1)?,
+            &[
+                (b"greenville".to_vec(), DocAddress::new(0, 1)),
+                (b"austin".to_vec(), DocAddress::new(0, 0)),
+            ]
+        );
+
+        assert_eq!(
+            &query(&index, Order::Asc, 3, 0)?,
+            &[
+                (b"austin".to_vec(), DocAddress::new(0, 0)),
+                (b"greenville".to_vec(), DocAddress::new(0, 1)),
+                (b"tokyo".to_vec(), DocAddress::new(0, 2)),
+            ]
+        );
+
+        assert_eq!(
+            &query(&index, Order::Asc, 2, 1)?,
+            &[
+                (b"greenville".to_vec(), DocAddress::new(0, 1)),
+                (b"tokyo".to_vec(), DocAddress::new(0, 2)),
+            ]
+        );
+
+        assert_eq!(
+            &query(&index, Order::Asc, 2, 0)?,
+            &[
+                (b"austin".to_vec(), DocAddress::new(0, 0)),
+                (b"greenville".to_vec(), DocAddress::new(0, 1)),
+            ]
+        );
+
+        assert_eq!(&query(&index, Order::Asc, 3, 3)?, &[]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_top_field_collector_bytes_multisegment() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let bytes = schema_builder.add_bytes_field("bytes", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_for_tests()?;
+
+        index_writer.add_document(doc!(bytes => b"bbb".to_vec()))?;
+        index_writer.add_document(doc!(bytes => b"ddd".to_vec()))?;
+        index_writer.commit()?;
+
+        index_writer.add_document(doc!(bytes => b"aaa".to_vec()))?;
+        index_writer.add_document(doc!(bytes => b"ccc".to_vec()))?;
+        index_writer.commit()?;
+
+        let searcher = index.reader()?.searcher();
+
+        let top_docs_asc: Vec<(Vec<u8>, DocAddress)> = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(4).order_by_bytes_fast_field("bytes", Order::Asc),
+        )?;
+        let top_docs_desc: Vec<(Vec<u8>, DocAddress)> = searcher.search(
+            &AllQuery,
+            &TopDocs::with_limit(4).order_by_bytes_fast_field("bytes", Order::Desc),
+        )?;
+
+        let all_results = searcher
+            .search(&AllQuery, &DocSetCollector)?
+            .into_iter()
+            .map(|doc_address| {
+                let column = searcher.segment_readers()[doc_address.segment_ord as usize]
+                    .fast_fields()
+                    .bytes("bytes")
+                    .unwrap()
+                    .unwrap();
+                let term_ord = column.term_ords(doc_address.doc_id).next().unwrap();
+                let mut bytes = Vec::new();
+                column.dictionary().ord_to_term(term_ord, &mut bytes).unwrap();
+                (bytes, doc_address)
+            })
+            .collect::<Vec<_>>();
+
+        let mut expected_asc: Vec<ComparableDoc<_, _, false>> = all_results
+            .iter()
+            .cloned()
+            .map(|(feature, doc)| ComparableDoc { feature, doc })
+            .collect();
+        expected_asc.sort();
+        let expected_asc = expected_asc
+            .into_iter()
+            .map(|cdoc| (cdoc.feature, cdoc.doc))
+            .collect::<Vec<_>>();
+        assert_eq!(expected_asc, top_docs_asc);
+
+        let mut expected_desc: Vec<ComparableDoc<_, _, true>> = all_results
+            .into_iter()
+            .map(|(feature, doc)| ComparableDoc { feature, doc })
+            .collect();
+        expected_desc.sort();
+        let expected_desc = expected_desc
+            .into_iter()
+            .map(|cdoc| (cdoc.feature, cdoc.doc))
+            .collect::<Vec<_>>();
+        assert_eq!(expected_desc, top_docs_desc);
+
+        Ok(())
+    }
+
     proptest! {
         #[test]
         fn test_top_field_collect_string_prop(
@@ -1785,7 +2115,7 @@ mod tests {
                 let term_ord = column.term_ords(doc_address.doc_id).next().unwrap();
                 let mut city = Vec::new();
                 column.dictionary().ord_to_term(term_ord, &mut city).unwrap();
-                (String::try_from(city).unwrap(), doc_address)
+                (String::from_utf8(city).unwrap(), doc_address)
             });
 
             // Using the TopDocs collector should always be equivalent to sorting, skipping the
