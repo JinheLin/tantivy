@@ -1,10 +1,8 @@
 # P4-14 Deletes & Alive Bitset：删的是 term，看的是真相
 
-> 版本基线：tantivy 0.24.0（本仓库）
->
-> 本文主问题：Tantivy 的删除为什么是“delete term / delete query”？alive bitset 如何让删除在搜索时可见？
->
-> 本文产出：删除可见性时序图 1 张 + 可运行实验 1 个 + 关键源码入口清单
+## 核心问题
+
+Tantivy 的删除为什么是“delete term / delete query”？alive bitset 如何让删除在搜索时可见？
 
 ## 本文目标
 
@@ -18,7 +16,7 @@
 - 知道 `Term` 的含义（`field + value`）以及 `TermQuery` 的基本行为
 - 能接受一个事实：doc_id 是 **segment 内部编号**，并不稳定（merge 后会变）
 
-## 关键概念（先给结论）
+## 关键概念
 
 - **删除是逻辑删除，不改倒排**：删除不会立刻“物理移除”文档；倒排/postings 里仍可能出现这些 doc_id，只是搜索收集阶段会被过滤掉
 - **delete_term 本质是 delete(query)**：`IndexWriter::delete_term` 只是把 `Term` 包成 `TermQuery`，内部走 `delete_query`，最终记录的是 `DeleteOperation { opstamp, target: Weight }`
