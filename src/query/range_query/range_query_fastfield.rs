@@ -175,7 +175,8 @@ impl Weight for FastFieldRangeWeight {
             };
             search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound))
         } else if field_type.value_type() == Type::Bytes {
-            let Some(bytes_dict_column): Option<BytesColumn> = reader.fast_fields().bytes(&field_name)?
+            let Some(bytes_dict_column): Option<BytesColumn> =
+                reader.fast_fields().bytes(&field_name)?
             else {
                 return Ok(Box::new(EmptyScorer));
             };
