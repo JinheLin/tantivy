@@ -166,6 +166,7 @@ mod future_result;
 
 // Re-exports
 pub use common::{ByteCount, DateTime};
+#[rustfmt::skip]
 pub use {columnar, query_grammar, time};
 
 pub use crate::error::TantivyError;

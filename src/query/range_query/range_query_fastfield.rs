@@ -6,8 +6,8 @@ use std::net::Ipv6Addr;
 use std::ops::{Bound, RangeInclusive};
 
 use columnar::{
-    Column, ColumnType, MonotonicallyMappableToU128, MonotonicallyMappableToU64, NumericalType,
-    StrColumn,
+    BytesColumn, Column, ColumnType, MonotonicallyMappableToU128, MonotonicallyMappableToU64,
+    NumericalType, StrColumn,
 };
 use common::bounds::{BoundsRange, TransformBound};
 
@@ -170,6 +170,25 @@ impl Weight for FastFieldRangeWeight {
             let fast_field_reader = reader.fast_fields();
             let Some((column, _col_type)) =
                 fast_field_reader.u64_lenient_for_type(None, &field_name)?
+            else {
+                return Ok(Box::new(EmptyScorer));
+            };
+            search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound))
+        } else if field_type.value_type() == Type::Bytes {
+            let Some(bytes_dict_column): Option<BytesColumn> =
+                reader.fast_fields().bytes(&field_name)?
+            else {
+                return Ok(Box::new(EmptyScorer));
+            };
+            let dict = bytes_dict_column.dictionary();
+
+            let bounds = self.bounds.map_bound(get_value_bytes);
+            // Get term ids for terms
+            let (lower_bound, upper_bound) =
+                dict.term_bounds_to_ord(bounds.lower_bound, bounds.upper_bound)?;
+            let fast_field_reader = reader.fast_fields();
+            let Some((column, _col_type)) =
+                fast_field_reader.u64_lenient_for_type(Some(&[ColumnType::Bytes]), &field_name)?
             else {
                 return Ok(Box::new(EmptyScorer));
             };
@@ -543,6 +562,50 @@ mod tests {
         test_query("title:[* TO ddd]", 2);
         test_query("title:[* TO ddd}", 1);
         test_query("title:[* TO eee]", 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_bytes_field_ff_range_query() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let bytes = schema_builder.add_bytes_field("bytes", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+
+        {
+            let mut index_writer = index.writer_for_tests()?;
+            index_writer.add_document(doc!(bytes => b"bbb".to_vec()))?;
+            index_writer.add_document(doc!(bytes => b"ddd".to_vec()))?;
+            index_writer.add_document(doc!(bytes => b"fff".to_vec()))?;
+            index_writer.commit()?;
+        }
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let count = |range_query: RangeQuery| searcher.search(&range_query, &Count).unwrap();
+
+        assert_eq!(
+            count(RangeQuery::new(
+                Bound::Included(Term::from_field_bytes(bytes, b"bbb")),
+                Bound::Included(Term::from_field_bytes(bytes, b"ddd")),
+            )),
+            2
+        );
+        assert_eq!(
+            count(RangeQuery::new(
+                Bound::Excluded(Term::from_field_bytes(bytes, b"bbb")),
+                Bound::Included(Term::from_field_bytes(bytes, b"ddd")),
+            )),
+            1
+        );
+        assert_eq!(
+            count(RangeQuery::new(
+                Bound::Included(Term::from_field_bytes(bytes, b"d")),
+                Bound::Unbounded,
+            )),
+            2
+        );
 
         Ok(())
     }
