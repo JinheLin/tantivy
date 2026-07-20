@@ -2,7 +2,10 @@ use crate::docset::{DocSet, COLLECT_BLOCK_BUFFER_LEN, TERMINATED};
 use crate::index::SegmentReader;
 use crate::query::boost_query::BoostScorer;
 use crate::query::explanation::does_not_match;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::{
+    DocumentEvaluation, EnableScoring, Explanation, Query, Scorer, SingleDocument,
+    SingleDocumentEvaluationContext, SingleDocumentEvaluator, Weight,
+};
 use crate::{DocId, Score};
 
 /// Query that matches all of the documents.
@@ -14,6 +17,35 @@ pub struct AllQuery;
 impl Query for AllQuery {
     fn weight(&self, _: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(AllWeight))
+    }
+
+    fn single_document_evaluator(
+        &self,
+        context: SingleDocumentEvaluationContext<'_>,
+    ) -> crate::Result<Box<dyn SingleDocumentEvaluator>> {
+        let score = if context.is_scoring_enabled() {
+            context.boost()
+        } else {
+            1.0
+        };
+        Ok(Box::new(AllSingleDocumentEvaluator { score }))
+    }
+}
+
+struct AllSingleDocumentEvaluator {
+    score: Score,
+}
+
+impl SingleDocumentEvaluator for AllSingleDocumentEvaluator {
+    fn evaluate_impl(
+        &mut self,
+        _document: &dyn SingleDocument,
+    ) -> crate::Result<DocumentEvaluation> {
+        Ok(DocumentEvaluation::Match(self.score))
+    }
+
+    fn required_fields(&self) -> Option<&[crate::schema::Field]> {
+        Some(&[])
     }
 }
 

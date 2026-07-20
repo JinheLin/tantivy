@@ -28,6 +28,10 @@ pub(crate) struct PathToUnorderedId {
 }
 
 impl PathToUnorderedId {
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+    }
+
     #[inline]
     pub(crate) fn get_or_allocate_unordered_id(&mut self, path: &str) -> u32 {
         if let Some(id) = self.map.get(path) {
@@ -88,5 +92,8 @@ mod tests {
             .map(|id| path_to_id.ordered_id_to_path()[id.path_id() as usize])
             .collect::<Vec<&str>>();
         assert_eq!(terms_fetched, terms);
+
+        path_to_id.clear();
+        assert_eq!(path_to_id.get_or_allocate_unordered_id("new"), 0);
     }
 }

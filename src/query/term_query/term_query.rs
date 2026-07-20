@@ -2,9 +2,13 @@ use std::fmt;
 
 use super::term_weight::TermWeight;
 use crate::query::bm25::Bm25Weight;
-use crate::query::{EnableScoring, Explanation, Query, Weight};
+use crate::query::single_document::{effective_record_option, validate_term_info};
+use crate::query::{
+    DocumentEvaluation, EnableScoring, Explanation, Query, SingleDocument,
+    SingleDocumentEvaluationContext, SingleDocumentEvaluator, Weight,
+};
 use crate::schema::IndexRecordOption;
-use crate::Term;
+use crate::{TantivyError, Term};
 
 /// A Term query matches all of the documents
 /// containing a specific term.
@@ -124,8 +128,81 @@ impl Query for TermQuery {
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         Ok(Box::new(self.specialized_weight(enable_scoring)?))
     }
+
+    fn single_document_evaluator(
+        &self,
+        context: SingleDocumentEvaluationContext<'_>,
+    ) -> crate::Result<Box<dyn SingleDocumentEvaluator>> {
+        let (record_option, has_fieldnorms) =
+            effective_record_option(context.schema(), &self.term, self.index_record_option)?;
+        let bm25_weight = context
+            .statistics_provider()
+            .map(|statistics| -> crate::Result<Bm25Weight> {
+                // Caller must supply valid BM25 statistics; see `single_document` module docs.
+                Ok(
+                    Bm25Weight::for_terms(statistics, std::slice::from_ref(&self.term))?
+                        .boost_by(context.boost()),
+                )
+            })
+            .transpose()?;
+        Ok(Box::new(TermSingleDocumentEvaluator {
+            field: self.term.field(),
+            term: self.term.clone(),
+            record_option,
+            has_fieldnorms,
+            bm25_weight,
+        }))
+    }
+
     fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
         visitor(&self.term, false);
+    }
+}
+
+struct TermSingleDocumentEvaluator {
+    field: crate::schema::Field,
+    term: Term,
+    record_option: IndexRecordOption,
+    has_fieldnorms: bool,
+    bm25_weight: Option<Bm25Weight>,
+}
+
+impl SingleDocumentEvaluator for TermSingleDocumentEvaluator {
+    fn evaluate_impl(
+        &mut self,
+        document: &dyn SingleDocument,
+    ) -> crate::Result<DocumentEvaluation> {
+        let Some(term_info) = document.term_info(&self.term) else {
+            return Ok(DocumentEvaluation::NoMatch);
+        };
+        validate_term_info(&self.term, term_info.term_freq)?;
+
+        let Some(bm25_weight) = &self.bm25_weight else {
+            return Ok(DocumentEvaluation::Match(1.0));
+        };
+        let term_freq = if self.record_option.has_freq() {
+            term_info.term_freq
+        } else {
+            1
+        };
+        let fieldnorm_id = if self.has_fieldnorms {
+            document.fieldnorm_id(self.term.field()).ok_or_else(|| {
+                TantivyError::InvalidArgument(format!(
+                    "SingleDocument did not supply a fieldnorm for field {:?}",
+                    self.term.field()
+                ))
+            })?
+        } else {
+            // Segment scorers use `FieldNormReader::constant(_, 1)` when fieldnorms are disabled;
+            // `fieldnorm_to_id(1)` is also 1.
+            1
+        };
+        let score = bm25_weight.score(fieldnorm_id, term_freq);
+        Ok(DocumentEvaluation::Match(score))
+    }
+
+    fn required_fields(&self) -> Option<&[crate::schema::Field]> {
+        Some(std::slice::from_ref(&self.field))
     }
 }
 

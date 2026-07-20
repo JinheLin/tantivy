@@ -88,6 +88,9 @@ pub enum TantivyError {
     /// Invalid argument was passed by the user.
     #[error("An invalid argument was passed: '{0}'")]
     InvalidArgument(String),
+    /// The query does not support single-document evaluation.
+    #[error("Query is unsupported for single-document evaluation: '{0}'")]
+    UnsupportedQueryForSingleDocumentEvaluation(String),
     /// An Error occurred in one of the threads.
     #[error("An error occurred in a thread: '{0}'")]
     ErrorInThread(String),

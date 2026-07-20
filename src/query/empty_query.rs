@@ -1,7 +1,10 @@
 use super::Scorer;
 use crate::docset::TERMINATED;
 use crate::query::explanation::does_not_match;
-use crate::query::{EnableScoring, Explanation, Query, Weight};
+use crate::query::{
+    DocumentEvaluation, EnableScoring, Explanation, Query, SingleDocument,
+    SingleDocumentEvaluationContext, SingleDocumentEvaluator, Weight,
+};
 use crate::{DocId, DocSet, Score, Searcher, SegmentReader};
 
 /// `EmptyQuery` is a dummy `Query` in which no document matches.
@@ -15,8 +18,30 @@ impl Query for EmptyQuery {
         Ok(Box::new(EmptyWeight))
     }
 
+    fn single_document_evaluator(
+        &self,
+        _context: SingleDocumentEvaluationContext<'_>,
+    ) -> crate::Result<Box<dyn SingleDocumentEvaluator>> {
+        Ok(Box::new(EmptySingleDocumentEvaluator))
+    }
+
     fn count(&self, _searcher: &Searcher) -> crate::Result<usize> {
         Ok(0)
+    }
+}
+
+struct EmptySingleDocumentEvaluator;
+
+impl SingleDocumentEvaluator for EmptySingleDocumentEvaluator {
+    fn evaluate_impl(
+        &mut self,
+        _document: &dyn SingleDocument,
+    ) -> crate::Result<DocumentEvaluation> {
+        Ok(DocumentEvaluation::NoMatch)
+    }
+
+    fn required_fields(&self) -> Option<&[crate::schema::Field]> {
+        Some(&[])
     }
 }
 

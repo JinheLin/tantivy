@@ -1,5 +1,10 @@
 use super::boolean_weight::BooleanWeight;
-use crate::query::{EnableScoring, Occur, Query, SumWithCoordsCombiner, TermQuery, Weight};
+use crate::query::single_document::with_unsupported_query_path;
+use crate::query::{
+    DocumentEvaluation, EnableScoring, Occur, Query, SingleDocument,
+    SingleDocumentEvaluationContext, SingleDocumentEvaluator, SumWithCoordsCombiner, TermQuery,
+    Weight,
+};
 use crate::schema::{IndexRecordOption, Term};
 
 /// The boolean query returns a set of documents
@@ -14,6 +19,8 @@ use crate::schema::{IndexRecordOption, Term};
 /// * match at least one of the sub queries associated
 /// with the `Must` or `Should` occurrence.
 ///
+/// A query containing only `MustNot` clauses matches no documents. To match all documents except
+/// those excluded by a clause, add an [`AllQuery`](crate::query::AllQuery) as a `Must` clause.
 ///
 /// You can combine other query types and their `Occur`ances into one `BooleanQuery`
 ///
@@ -156,11 +163,121 @@ impl Query for BooleanQuery {
         )))
     }
 
+    fn single_document_evaluator(
+        &self,
+        context: SingleDocumentEvaluationContext<'_>,
+    ) -> crate::Result<Box<dyn SingleDocumentEvaluator>> {
+        let mut must = Vec::new();
+        let mut should = Vec::new();
+        let mut must_not = Vec::new();
+        let skip_should = !context.is_scoring_enabled()
+            && self
+                .subqueries
+                .iter()
+                .any(|(occur, _)| *occur == Occur::Must);
+        for (clause_index, (occur, subquery)) in self.subqueries.iter().enumerate() {
+            if skip_should && *occur == Occur::Should {
+                continue;
+            }
+            let path = format!("BooleanQuery.{occur:?}[{clause_index}]");
+            let child_context = if *occur == Occur::MustNot {
+                context.scoring_disabled()
+            } else {
+                context
+            };
+            let evaluator = subquery
+                .single_document_evaluator(child_context)
+                .map_err(|error| with_unsupported_query_path(error, path))?;
+            match occur {
+                Occur::Must => must.push(evaluator),
+                Occur::Should => should.push(evaluator),
+                Occur::MustNot => must_not.push(evaluator),
+            }
+        }
+        let required_fields = collect_required_fields(&must, &should, &must_not);
+        Ok(Box::new(BooleanSingleDocumentEvaluator {
+            must,
+            should,
+            must_not,
+            scoring_enabled: context.is_scoring_enabled(),
+            required_fields,
+        }))
+    }
+
     fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
         for (_occur, subquery) in &self.subqueries {
             subquery.query_terms(visitor);
         }
     }
+}
+
+struct BooleanSingleDocumentEvaluator {
+    must: Vec<Box<dyn SingleDocumentEvaluator>>,
+    should: Vec<Box<dyn SingleDocumentEvaluator>>,
+    must_not: Vec<Box<dyn SingleDocumentEvaluator>>,
+    scoring_enabled: bool,
+    required_fields: Option<Vec<crate::schema::Field>>,
+}
+
+impl SingleDocumentEvaluator for BooleanSingleDocumentEvaluator {
+    fn evaluate_impl(
+        &mut self,
+        document: &dyn SingleDocument,
+    ) -> crate::Result<DocumentEvaluation> {
+        for evaluator in &mut self.must_not {
+            if matches!(evaluator.evaluate(document)?, DocumentEvaluation::Match(_)) {
+                return Ok(DocumentEvaluation::NoMatch);
+            }
+        }
+
+        let mut score = 0.0;
+        for evaluator in &mut self.must {
+            let DocumentEvaluation::Match(child_score) = evaluator.evaluate(document)? else {
+                return Ok(DocumentEvaluation::NoMatch);
+            };
+            if self.scoring_enabled {
+                score += child_score;
+            }
+        }
+
+        if !self.scoring_enabled && !self.must.is_empty() {
+            return Ok(DocumentEvaluation::Match(1.0));
+        }
+
+        let mut should_match = false;
+        for evaluator in &mut self.should {
+            if let DocumentEvaluation::Match(child_score) = evaluator.evaluate(document)? {
+                if !self.scoring_enabled {
+                    return Ok(DocumentEvaluation::Match(1.0));
+                }
+                should_match = true;
+                score += child_score;
+            }
+        }
+
+        if self.must.is_empty() && !should_match {
+            return Ok(DocumentEvaluation::NoMatch);
+        }
+        Ok(DocumentEvaluation::Match(score))
+    }
+
+    fn required_fields(&self) -> Option<&[crate::schema::Field]> {
+        self.required_fields.as_deref()
+    }
+}
+
+fn collect_required_fields(
+    must: &[Box<dyn SingleDocumentEvaluator>],
+    should: &[Box<dyn SingleDocumentEvaluator>],
+    must_not: &[Box<dyn SingleDocumentEvaluator>],
+) -> Option<Vec<crate::schema::Field>> {
+    let mut fields = Vec::new();
+    for evaluator in must.iter().chain(should.iter()).chain(must_not.iter()) {
+        fields.extend_from_slice(evaluator.required_fields()?);
+    }
+    fields.sort_unstable();
+    fields.dedup();
+    Some(fields)
 }
 
 impl BooleanQuery {

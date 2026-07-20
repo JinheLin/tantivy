@@ -22,6 +22,7 @@ mod regex_query;
 mod reqopt_scorer;
 mod scorer;
 mod set_query;
+mod single_document;
 mod term_query;
 mod union;
 mod weight;
@@ -61,6 +62,10 @@ pub use self::score_combiner::{
 };
 pub use self::scorer::Scorer;
 pub use self::set_query::TermSetQuery;
+pub use self::single_document::{
+    DocumentEvaluation, PreparedSingleDocument, SingleDocument, SingleDocumentEvaluationContext,
+    SingleDocumentEvaluator, SingleDocumentPreparer, SingleDocumentScoring, SingleDocumentTermInfo,
+};
 pub use self::term_query::TermQuery;
 pub use self::union::Union;
 #[cfg(test)]
