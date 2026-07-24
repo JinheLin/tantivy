@@ -3,7 +3,7 @@ use std::fmt;
 use downcast_rs::impl_downcast;
 
 use super::bm25::Bm25StatisticsProvider;
-use super::Weight;
+use super::{SingleDocumentEvaluationContext, SingleDocumentEvaluator, Weight};
 use crate::core::searcher::Searcher;
 use crate::query::Explanation;
 use crate::schema::Schema;
@@ -134,6 +134,38 @@ pub trait Query: QueryClone + Send + Sync + downcast_rs::Downcast + fmt::Debug {
     /// See [`Weight`].
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>>;
 
+    /// Compiles this query for repeated evaluation of pre-tokenized external documents.
+    ///
+    /// See the [`single_document` module](crate::query::single_document#single-document-evaluation)
+    /// for the built-in support matrix and query-specific constraints.
+    ///
+    /// Every term reported as present by [`SingleDocument`](crate::query::SingleDocument) must have
+    /// a non-zero term frequency. Positions are required only by `PhraseQuery`; other supported
+    /// query types allow them to be omitted. When BM25 scoring is enabled for a `TermQuery` or
+    /// `PhraseQuery`, a fieldnorm is also required for fields configured with fieldnorms.
+    ///
+    /// Callers must also supply valid BM25 statistics and finite query scores or boosts when
+    /// scoring is enabled. See the
+    /// [`single_document`](crate::query::single_document#caller-responsibilities) module for
+    /// details. Invalid numeric inputs are not checked here and may panic or produce non-finite
+    /// scores.
+    ///
+    /// Common errors are:
+    ///
+    /// - `TantivyError::UnsupportedQueryForSingleDocumentEvaluation` for unsupported query shapes,
+    /// - `TantivyError::InvalidArgument` for malformed document data or scoring inputs, and
+    /// - `TantivyError::SchemaError` for missing or non-indexed fields.
+    fn single_document_evaluator(
+        &self,
+        _context: SingleDocumentEvaluationContext<'_>,
+    ) -> crate::Result<Box<dyn SingleDocumentEvaluator>> {
+        Err(
+            crate::TantivyError::UnsupportedQueryForSingleDocumentEvaluation(
+                std::any::type_name::<Self>().to_string(),
+            ),
+        )
+    }
+
     /// Returns an `Explanation` for the score of the document.
     fn explain(&self, searcher: &Searcher, doc_address: DocAddress) -> crate::Result<Explanation> {
         let weight = self.weight(EnableScoring::enabled_from_searcher(searcher))?;
@@ -179,6 +211,13 @@ where T: 'static + Query + Clone
 impl Query for Box<dyn Query> {
     fn weight(&self, enabled_scoring: EnableScoring) -> crate::Result<Box<dyn Weight>> {
         self.as_ref().weight(enabled_scoring)
+    }
+
+    fn single_document_evaluator(
+        &self,
+        context: SingleDocumentEvaluationContext<'_>,
+    ) -> crate::Result<Box<dyn SingleDocumentEvaluator>> {
+        self.as_ref().single_document_evaluator(context)
     }
 
     fn count(&self, searcher: &Searcher) -> crate::Result<usize> {

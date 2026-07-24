@@ -1,7 +1,11 @@
 use std::fmt;
 
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::single_document::with_unsupported_query_path;
+use crate::query::{
+    DocumentEvaluation, EnableScoring, Explanation, Query, Scorer, SingleDocument,
+    SingleDocumentEvaluationContext, SingleDocumentEvaluator, Weight,
+};
 use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 
 /// `ConstScoreQuery` is a wrapper over a query to provide a constant score.
@@ -16,6 +20,8 @@ pub struct ConstScoreQuery {
 
 impl ConstScoreQuery {
     /// Builds a const score query.
+    ///
+    /// `score` must be finite when used with single-document evaluation and scoring enabled.
     pub fn new(query: Box<dyn Query>, score: Score) -> ConstScoreQuery {
         ConstScoreQuery { query, score }
     }
@@ -46,8 +52,46 @@ impl Query for ConstScoreQuery {
         })
     }
 
+    fn single_document_evaluator(
+        &self,
+        context: SingleDocumentEvaluationContext<'_>,
+    ) -> crate::Result<Box<dyn SingleDocumentEvaluator>> {
+        // Caller must supply a finite `self.score` and context boost; not validated here.
+        let score = if context.is_scoring_enabled() {
+            context.boost() * self.score
+        } else {
+            1.0
+        };
+        let child = self
+            .query
+            .single_document_evaluator(context.scoring_disabled())
+            .map_err(|error| with_unsupported_query_path(error, "ConstScoreQuery"))?;
+        Ok(Box::new(ConstSingleDocumentEvaluator { child, score }))
+    }
+
     fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
         self.query.query_terms(visitor);
+    }
+}
+
+struct ConstSingleDocumentEvaluator {
+    child: Box<dyn SingleDocumentEvaluator>,
+    score: Score,
+}
+
+impl SingleDocumentEvaluator for ConstSingleDocumentEvaluator {
+    fn evaluate_impl(
+        &mut self,
+        document: &dyn SingleDocument,
+    ) -> crate::Result<DocumentEvaluation> {
+        match self.child.evaluate(document)? {
+            DocumentEvaluation::Match(_) => Ok(DocumentEvaluation::Match(self.score)),
+            DocumentEvaluation::NoMatch => Ok(DocumentEvaluation::NoMatch),
+        }
+    }
+
+    fn required_fields(&self) -> Option<&[crate::schema::Field]> {
+        self.child.required_fields()
     }
 }
 

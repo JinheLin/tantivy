@@ -2,7 +2,11 @@ use std::fmt;
 
 use crate::docset::COLLECT_BLOCK_BUFFER_LEN;
 use crate::fastfield::AliveBitSet;
-use crate::query::{EnableScoring, Explanation, Query, Scorer, Weight};
+use crate::query::single_document::with_unsupported_query_path;
+use crate::query::{
+    EnableScoring, Explanation, Query, Scorer, SingleDocumentEvaluationContext,
+    SingleDocumentEvaluator, Weight,
+};
 use crate::{DocId, DocSet, Score, SegmentReader, Term};
 
 /// `BoostQuery` is a wrapper over a query used to boost its score.
@@ -17,6 +21,8 @@ pub struct BoostQuery {
 
 impl BoostQuery {
     /// Builds a boost query.
+    ///
+    /// `boost` must be finite when used with single-document evaluation and scoring enabled.
     pub fn new(query: Box<dyn Query>, boost: Score) -> BoostQuery {
         BoostQuery { query, boost }
     }
@@ -46,6 +52,21 @@ impl Query for BoostQuery {
             weight_without_boost
         };
         Ok(boosted_weight)
+    }
+
+    fn single_document_evaluator(
+        &self,
+        context: SingleDocumentEvaluationContext<'_>,
+    ) -> crate::Result<Box<dyn SingleDocumentEvaluator>> {
+        // Caller must supply a finite `self.boost`; not validated here.
+        let child_context = if context.is_scoring_enabled() {
+            context.with_boost(self.boost)
+        } else {
+            context
+        };
+        self.query
+            .single_document_evaluator(child_context)
+            .map_err(|error| with_unsupported_query_path(error, "BoostQuery"))
     }
 
     fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {

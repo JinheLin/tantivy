@@ -45,12 +45,19 @@ impl<TPostings: Postings> DocSet for PostingsWithOffset<TPostings> {
 
 pub struct PhraseScorer<TPostings: Postings> {
     intersection_docset: Intersection<PostingsWithOffset<TPostings>, PostingsWithOffset<TPostings>>,
-    num_terms: usize,
-    left_positions: Vec<u32>,
-    right_positions: Vec<u32>,
+    matcher: PhraseMatcher,
     phrase_count: u32,
     fieldnorm_reader: FieldNormReader,
     similarity_weight_opt: Option<Bm25Weight>,
+}
+
+pub(crate) struct PhraseMatcher {
+    num_terms: usize,
+    // Scratch buffers reused by both segment scoring and single-document evaluation. Matching
+    // clears or overwrites their contents while retaining capacity to avoid per-document
+    // allocations; consequently, capacity tracks the largest document seen by this matcher.
+    left_positions: Vec<u32>,
+    right_positions: Vec<u32>,
     slop: u32,
     left_slops: Vec<u8>,
     positions_buffer: Vec<u32>,
@@ -344,6 +351,110 @@ fn intersection_count_with_carrying_slop(
     count
 }
 
+impl PhraseMatcher {
+    pub(crate) fn new(num_terms: usize, slop: u32) -> Self {
+        PhraseMatcher {
+            num_terms,
+            left_positions: Vec::with_capacity(100),
+            right_positions: Vec::with_capacity(100),
+            slop,
+            left_slops: Vec::with_capacity(100),
+            slops_buffer: Vec::with_capacity(100),
+            positions_buffer: Vec::with_capacity(100),
+        }
+    }
+
+    pub(crate) fn phrase_exists(
+        &mut self,
+        mut load_positions: impl FnMut(usize, &mut Vec<u32>),
+    ) -> bool {
+        self.compute_phrase_match(&mut load_positions);
+        if self.has_slop() {
+            intersection_exists_with_slop(
+                &self.left_positions,
+                &self.right_positions[..],
+                self.slop,
+            )
+        } else {
+            intersection_exists(&self.left_positions, &self.right_positions[..])
+        }
+    }
+
+    pub(crate) fn phrase_count(
+        &mut self,
+        mut load_positions: impl FnMut(usize, &mut Vec<u32>),
+    ) -> u32 {
+        self.compute_phrase_match(&mut load_positions);
+        if self.has_slop() {
+            if self.num_terms > 2 {
+                intersection_count_with_carrying_slop(
+                    &mut self.left_positions,
+                    &mut self.left_slops,
+                    &self.right_positions[..],
+                    self.slop,
+                    false,
+                    &mut self.positions_buffer,
+                    &mut self.slops_buffer,
+                )
+            } else {
+                intersection_count_with_slop(
+                    &mut self.left_positions,
+                    &self.right_positions[..],
+                    self.slop,
+                    false,
+                ) as u32
+            }
+        } else {
+            intersection_count(&self.left_positions, &self.right_positions[..]) as u32
+        }
+    }
+
+    pub(crate) fn get_intersection(&mut self) -> &[u32] {
+        intersection(&mut self.left_positions, &self.right_positions);
+        &self.left_positions
+    }
+
+    fn compute_phrase_match(&mut self, load_positions: &mut impl FnMut(usize, &mut Vec<u32>)) {
+        load_positions(0, &mut self.left_positions);
+        if self.has_slop() {
+            self.left_slops.clear();
+        }
+        for i in 1..self.num_terms - 1 {
+            load_positions(i, &mut self.right_positions);
+            if self.has_slop() {
+                if self.num_terms > 2 {
+                    intersection_count_with_carrying_slop(
+                        &mut self.left_positions,
+                        &mut self.left_slops,
+                        &self.right_positions[..],
+                        self.slop,
+                        true,
+                        &mut self.positions_buffer,
+                        &mut self.slops_buffer,
+                    );
+                } else {
+                    intersection_count_with_slop(
+                        &mut self.left_positions,
+                        &self.right_positions[..],
+                        self.slop,
+                        true,
+                    );
+                }
+            } else {
+                intersection(&mut self.left_positions, &self.right_positions);
+            }
+            if self.left_positions.is_empty() {
+                return;
+            }
+        }
+        load_positions(self.num_terms - 1, &mut self.right_positions);
+    }
+
+    fn has_slop(&self) -> bool {
+        self.slop > 0
+    }
+}
+
 impl<TPostings: Postings> PhraseScorer<TPostings> {
     // If similarity_weight is None, then scoring is disabled.
     pub fn new(
@@ -383,16 +494,10 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
             .collect::<Vec<_>>();
         let mut scorer = PhraseScorer {
             intersection_docset: Intersection::new(postings_with_offsets),
-            num_terms: num_docsets,
-            left_positions: Vec::with_capacity(100),
-            right_positions: Vec::with_capacity(100),
+            matcher: PhraseMatcher::new(num_docsets, slop),
             phrase_count: 0u32,
             similarity_weight_opt,
             fieldnorm_reader,
-            slop,
-            left_slops: Vec::with_capacity(100),
-            slops_buffer: Vec::with_capacity(100),
-            positions_buffer: Vec::with_capacity(100),
         };
         if scorer.doc() != TERMINATED && !scorer.phrase_match() {
             scorer.advance();
@@ -405,107 +510,23 @@ impl<TPostings: Postings> PhraseScorer<TPostings> {
     }
 
     pub(crate) fn get_intersection(&mut self) -> &[u32] {
-        intersection(&mut self.left_positions, &self.right_positions);
-        &self.left_positions
+        self.matcher.get_intersection()
     }
 
     fn phrase_match(&mut self) -> bool {
+        let intersection_docset = &mut self.intersection_docset;
+        let load_positions = |index: usize, output: &mut Vec<u32>| {
+            intersection_docset
+                .docset_mut_specialized(index)
+                .positions(output);
+        };
         if self.similarity_weight_opt.is_some() {
-            let count = self.compute_phrase_count();
+            let count = self.matcher.phrase_count(load_positions);
             self.phrase_count = count;
             count > 0u32
         } else {
-            self.phrase_exists()
+            self.matcher.phrase_exists(load_positions)
         }
-    }
-
-    fn phrase_exists(&mut self) -> bool {
-        self.compute_phrase_match();
-        if self.has_slop() {
-            intersection_exists_with_slop(
-                &self.left_positions,
-                &self.right_positions[..],
-                self.slop,
-            )
-        } else {
-            intersection_exists(&self.left_positions, &self.right_positions[..])
-        }
-    }
-
-    fn compute_phrase_count(&mut self) -> u32 {
-        self.compute_phrase_match();
-        if self.has_slop() {
-            if self.num_terms > 2 {
-                intersection_count_with_carrying_slop(
-                    &mut self.left_positions,
-                    &mut self.left_slops,
-                    &self.right_positions[..],
-                    self.slop,
-                    false,
-                    &mut self.positions_buffer,
-                    &mut self.slops_buffer,
-                )
-            } else {
-                intersection_count_with_slop(
-                    &mut self.left_positions,
-                    &self.right_positions[..],
-                    self.slop,
-                    false,
-                ) as u32
-            }
-        } else {
-            intersection_count(&self.left_positions, &self.right_positions[..]) as u32
-        }
-    }
-
-    fn compute_phrase_match(&mut self) {
-        {
-            self.intersection_docset
-                .docset_mut_specialized(0)
-                .positions(&mut self.left_positions);
-            if self.has_slop() {
-                self.left_slops.clear();
-            }
-        }
-        for i in 1..self.num_terms - 1 {
-            {
-                self.intersection_docset
-                    .docset_mut_specialized(i)
-                    .positions(&mut self.right_positions);
-            }
-            if self.has_slop() {
-                if self.num_terms > 2 {
-                    intersection_count_with_carrying_slop(
-                        &mut self.left_positions,
-                        &mut self.left_slops,
-                        &self.right_positions[..],
-                        self.slop,
-                        true,
-                        &mut self.positions_buffer,
-                        &mut self.slops_buffer,
-                    );
-                } else {
-                    intersection_count_with_slop(
-                        &mut self.left_positions,
-                        &self.right_positions[..],
-                        self.slop,
-                        true,
-                    );
-                }
-            } else {
-                intersection(&mut self.left_positions, &self.right_positions);
-            };
-            if self.left_positions.is_empty() {
-                return;
-            }
-        }
-        self.intersection_docset
-            .docset_mut_specialized(self.num_terms - 1)
-            .positions(&mut self.right_positions);
-    }
-
-    fn has_slop(&self) -> bool {
-        self.slop > 0
     }
 }
 

@@ -1,24 +1,23 @@
-use columnar::MonotonicallyMappableToU64;
 use common::JsonPathWriter;
-use itertools::Itertools;
-use tokenizer_api::BoxTokenStream;
 
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
+use super::document_indexer::{
+    index_document, text_analyzers_for_schema, DocumentIndexingMode, DocumentIndexingOutput,
+};
 use super::operation::AddOperation;
-use crate::core::json_utils::index_json_values;
 use crate::fastfield::FastFieldsWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
 use crate::index::Segment;
 use crate::indexer::segment_serializer::SegmentSerializer;
 use crate::postings::{
-    compute_table_memory_size, serialize_postings, IndexingContext, IndexingPosition,
-    PerFieldPostingsWriter, PostingsWriter,
+    compute_table_memory_size, serialize_postings, IndexingContext, PerFieldPostingsWriter,
+    PostingsWriter,
 };
-use crate::schema::document::{Document, ReferenceValue, Value};
-use crate::schema::{FieldEntry, FieldType, Schema, Term, DATE_TIME_PRECISION_INDEXED};
+use crate::schema::document::Document;
+use crate::schema::{Field, Schema, Term};
 use crate::store::{StoreReader, StoreWriter};
-use crate::tokenizer::{FacetTokenizer, PreTokenizedStream, TextAnalyzer, Tokenizer};
-use crate::{DocId, Opstamp, SegmentComponent, TantivyError};
+use crate::tokenizer::TextAnalyzer;
+use crate::{DocId, Opstamp, SegmentComponent};
 
 /// Computes the initial size of the hash table.
 ///
@@ -74,6 +73,21 @@ pub struct SegmentWriter {
     schema: Schema,
 }
 
+struct SegmentWriterDocumentIndexingOutput<'a> {
+    postings_writers: &'a mut PerFieldPostingsWriter,
+    fieldnorms_writer: &'a mut FieldNormsWriter,
+}
+
+impl DocumentIndexingOutput for SegmentWriterDocumentIndexingOutput<'_> {
+    fn postings_writer(&mut self, field: Field) -> &mut dyn PostingsWriter {
+        self.postings_writers.get_for_field_mut(field)
+    }
+
+    fn record_fieldnorm(&mut self, doc: DocId, field: Field, fieldnorm: u32) {
+        self.fieldnorms_writer.record(doc, field, fieldnorm);
+    }
+}
+
 impl SegmentWriter {
     /// Creates a new `SegmentWriter`
     ///
@@ -91,28 +105,8 @@ impl SegmentWriter {
         let table_size = compute_initial_table_size(memory_budget_in_bytes)?;
         let segment_serializer = SegmentSerializer::for_segment(segment, false)?;
         let per_field_postings_writers = PerFieldPostingsWriter::for_schema(&schema);
-        let per_field_text_analyzers = schema
-            .fields()
-            .map(|(_, field_entry): (_, &FieldEntry)| {
-                let text_options = match field_entry.field_type() {
-                    FieldType::Str(ref text_options) => text_options.get_indexing_options(),
-                    FieldType::JsonObject(ref json_object_options) => {
-                        json_object_options.get_text_indexing_options()
-                    }
-                    _ => None,
-                };
-                let tokenizer_name = text_options
-                    .map(|text_index_option| text_index_option.tokenizer())
-                    .unwrap_or("default");
-
-                tokenizer_manager.get(tokenizer_name).ok_or_else(|| {
-                    TantivyError::SchemaError(format!(
-                        "Error getting tokenizer for field: {}",
-                        field_entry.name()
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let per_field_text_analyzers =
+            text_analyzers_for_schema(&schema, &tokenizer_manager, DocumentIndexingMode::Normal)?;
         Ok(Self {
             max_doc: 0,
             ctx: IndexingContext::new(table_size),
@@ -169,218 +163,21 @@ impl SegmentWriter {
     }
 
     fn index_document<D: Document>(&mut self, doc: &D) -> crate::Result<()> {
-        let doc_id = self.max_doc;
-
-        // TODO: Can this be optimised a bit?
-        let vals_grouped_by_field = doc
-            .iter_fields_and_values()
-            .sorted_by_key(|(field, _)| *field)
-            .group_by(|(field, _)| *field);
-
-        for (field, field_values) in &vals_grouped_by_field {
-            let values = field_values.map(|el| el.1);
-
-            let field_entry = self.schema.get_field_entry(field);
-            let make_schema_error = || {
-                TantivyError::SchemaError(format!(
-                    "Expected a {:?} for field {:?}",
-                    field_entry.field_type().value_type(),
-                    field_entry.name()
-                ))
-            };
-            if !field_entry.is_indexed() {
-                continue;
-            }
-
-            let (term_buffer, ctx) = (&mut self.term_buffer, &mut self.ctx);
-            let postings_writer: &mut dyn PostingsWriter =
-                self.per_field_postings_writers.get_for_field_mut(field);
-            term_buffer.clear_with_field_and_type(field_entry.field_type().value_type(), field);
-
-            match field_entry.field_type() {
-                FieldType::Facet(_) => {
-                    let mut facet_tokenizer = FacetTokenizer::default(); // this can be global
-                    for value_access in values {
-                        // Used to help with linting and type checking.
-                        let value = value_access as D::Value<'_>;
-
-                        let facet = value.as_facet().ok_or_else(make_schema_error)?;
-                        let facet_str = facet.encoded_str();
-                        let mut facet_tokenizer = facet_tokenizer.token_stream(facet_str);
-                        let mut indexing_position = IndexingPosition::default();
-                        postings_writer.index_text(
-                            doc_id,
-                            &mut facet_tokenizer,
-                            term_buffer,
-                            ctx,
-                            &mut indexing_position,
-                        );
-                    }
-                }
-                FieldType::Str(_) => {
-                    let mut indexing_position = IndexingPosition::default();
-                    for value_access in values {
-                        // Used to help with linting and type checking.
-                        let value = value_access as D::Value<'_>;
-
-                        let mut token_stream = if let Some(text) = value.as_str() {
-                            let text_analyzer =
-                                &mut self.per_field_text_analyzers[field.field_id() as usize];
-                            text_analyzer.token_stream(text)
-                        } else if let Some(tok_str) = value.as_pre_tokenized_text() {
-                            BoxTokenStream::new(PreTokenizedStream::from(tok_str.clone()))
-                        } else {
-                            continue;
-                        };
-
-                        assert!(term_buffer.is_empty());
-                        postings_writer.index_text(
-                            doc_id,
-                            &mut *token_stream,
-                            term_buffer,
-                            ctx,
-                            &mut indexing_position,
-                        );
-                    }
-                    if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer
-                            .record(doc_id, field, indexing_position.num_tokens);
-                    }
-                }
-                FieldType::U64(_) => {
-                    let mut num_vals = 0;
-                    for value_access in values {
-                        // Used to help with linting and type checking.
-                        let value = value_access as D::Value<'_>;
-
-                        num_vals += 1;
-                        let u64_val = value.as_u64().ok_or_else(make_schema_error)?;
-                        term_buffer.set_u64(u64_val);
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
-                    }
-                    if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
-                    }
-                }
-                FieldType::Date(_) => {
-                    let mut num_vals = 0;
-                    for value_access in values {
-                        // Used to help with linting and type checking.
-                        let value_access = value_access as D::Value<'_>;
-                        let value = value_access.as_value();
-
-                        num_vals += 1;
-                        let date_val = value.as_datetime().ok_or_else(make_schema_error)?;
-                        term_buffer
-                            .set_u64(date_val.truncate(DATE_TIME_PRECISION_INDEXED).to_u64());
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
-                    }
-                    if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
-                    }
-                }
-                FieldType::I64(_) => {
-                    let mut num_vals = 0;
-                    for value_access in values {
-                        // Used to help with linting and type checking.
-                        let value = value_access as D::Value<'_>;
-
-                        num_vals += 1;
-                        let i64_val = value.as_i64().ok_or_else(make_schema_error)?;
-                        term_buffer.set_i64(i64_val);
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
-                    }
-                    if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
-                    }
-                }
-                FieldType::F64(_) => {
-                    let mut num_vals = 0;
-                    for value_access in values {
-                        // Used to help with linting and type checking.
-                        let value = value_access as D::Value<'_>;
-
-                        num_vals += 1;
-                        let f64_val = value.as_f64().ok_or_else(make_schema_error)?;
-                        term_buffer.set_f64(f64_val);
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
-                    }
-                    if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
-                    }
-                }
-                FieldType::Bool(_) => {
-                    let mut num_vals = 0;
-                    for value_access in values {
-                        // Used to help with linting and type checking.
-                        let value = value_access as D::Value<'_>;
-
-                        num_vals += 1;
-                        let bool_val = value.as_bool().ok_or_else(make_schema_error)?;
-                        term_buffer.set_bool(bool_val);
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
-                    }
-                    if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
-                    }
-                }
-                FieldType::Bytes(_) => {
-                    let mut num_vals = 0;
-                    for value_access in values {
-                        // Used to help with linting and type checking.
-                        let value = value_access as D::Value<'_>;
-
-                        num_vals += 1;
-                        let bytes = value.as_bytes().ok_or_else(make_schema_error)?;
-                        term_buffer.set_bytes(bytes);
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
-                    }
-                    if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
-                    }
-                }
-                FieldType::JsonObject(json_options) => {
-                    let text_analyzer =
-                        &mut self.per_field_text_analyzers[field.field_id() as usize];
-                    let json_values_it = values.map(|value_access| {
-                        // Used to help with linting and type checking.
-                        let value_access = value_access as D::Value<'_>;
-                        let value = value_access.as_value();
-
-                        match value {
-                            ReferenceValue::Object(object_iter) => Ok(object_iter),
-                            _ => Err(make_schema_error()),
-                        }
-                    });
-                    index_json_values::<D::Value<'_>>(
-                        doc_id,
-                        json_values_it,
-                        text_analyzer,
-                        json_options.is_expand_dots_enabled(),
-                        term_buffer,
-                        postings_writer,
-                        &mut self.json_path_writer,
-                        ctx,
-                    )?;
-                }
-                FieldType::IpAddr(_) => {
-                    let mut num_vals = 0;
-                    for value_access in values {
-                        // Used to help with linting and type checking.
-                        let value = value_access as D::Value<'_>;
-
-                        num_vals += 1;
-                        let ip_addr = value.as_ip_addr().ok_or_else(make_schema_error)?;
-                        term_buffer.set_ip_addr(ip_addr);
-                        postings_writer.subscribe(doc_id, 0u32, term_buffer, ctx);
-                    }
-                    if field_entry.has_fieldnorms() {
-                        self.fieldnorms_writer.record(doc_id, field, num_vals);
-                    }
-                }
-            }
-        }
-        Ok(())
+        let mut output = SegmentWriterDocumentIndexingOutput {
+            postings_writers: &mut self.per_field_postings_writers,
+            fieldnorms_writer: &mut self.fieldnorms_writer,
+        };
+        index_document(
+            self.max_doc,
+            doc,
+            &self.schema,
+            DocumentIndexingMode::Normal,
+            &mut self.per_field_text_analyzers,
+            &mut self.term_buffer,
+            &mut self.json_path_writer,
+            &mut self.ctx,
+            &mut output,
+        )
     }
 
     /// Indexes a new document
