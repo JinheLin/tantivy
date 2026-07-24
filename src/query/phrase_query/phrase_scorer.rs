@@ -53,6 +53,9 @@ pub struct PhraseScorer<TPostings: Postings> {
 
 pub(crate) struct PhraseMatcher {
     num_terms: usize,
+    // Scratch buffers reused by both segment scoring and single-document evaluation. Matching
+    // clears or overwrites their contents while retaining capacity to avoid per-document
+    // allocations; consequently, capacity tracks the largest document seen by this matcher.
     left_positions: Vec<u32>,
     right_positions: Vec<u32>,
     slop: u32,

@@ -216,7 +216,11 @@ impl Query for PhraseQuery {
 struct PhraseSingleDocumentEvaluator {
     phrase_terms: Vec<(usize, Term)>,
     max_offset: usize,
+    // Per-document scratch. Evaluation clears the inner vectors but intentionally retains their
+    // capacity so a reusable evaluator does not allocate again for similar subsequent documents.
     adjusted_positions: Vec<Vec<u32>>,
+    // `PhraseMatcher` likewise owns reusable matching buffers whose capacity is retained across
+    // documents. Their lengths are reset before the buffers are populated for each evaluation.
     matcher: PhraseMatcher,
     field: Field,
     has_fieldnorms: bool,

@@ -84,6 +84,8 @@ impl SingleDocumentPreparer {
             DocumentIndexingMode::QueryAware(required_fields.as_ref()),
         )?;
         Ok(Self {
+            // `Schema` is backed by an `Arc`, so this clone only increments the reference count;
+            // it does not copy the schema's fields or indexing options.
             schema: schema.clone(),
             required_fields,
             per_field_text_analyzers,
@@ -360,10 +362,13 @@ struct PreparedDocumentPostingsWriter {
 
 impl PostingsWriter for PreparedDocumentPostingsWriter {
     fn subscribe(&mut self, _doc: DocId, position: u32, term: &Term, _ctx: &mut IndexingContext) {
-        self.term_positions
-            .entry(term.clone())
-            .or_default()
-            .push(position);
+        if let Some(positions) = self.term_positions.get_mut(term) {
+            positions.push(position);
+        } else {
+            // `Term` owns its byte buffer. Clone it only when inserting a new distinct term,
+            // instead of cloning once for every occurrence before an `entry` lookup.
+            self.term_positions.insert(term.clone(), vec![position]);
+        }
         self.total_num_tokens += 1;
     }
 
