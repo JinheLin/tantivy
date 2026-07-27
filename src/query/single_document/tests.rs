@@ -60,32 +60,12 @@ impl SingleDocument for TestDocument {
     }
 }
 
-struct RequiredFieldsEvaluator {
-    fields: Vec<Field>,
-}
-
-impl SingleDocumentEvaluator for RequiredFieldsEvaluator {
-    fn evaluate_impl(
-        &mut self,
-        _document: &dyn SingleDocument,
-    ) -> crate::Result<DocumentEvaluation> {
-        Ok(DocumentEvaluation::NoMatch)
-    }
-
-    fn required_fields(&self) -> Option<&[Field]> {
-        Some(&self.fields)
-    }
-}
-
 fn preparer_for_fields(
     schema: &Schema,
     tokenizer_manager: &TokenizerManager,
     fields: &[Field],
 ) -> crate::Result<SingleDocumentPreparer> {
-    let evaluator = RequiredFieldsEvaluator {
-        fields: fields.to_vec(),
-    };
-    SingleDocumentPreparer::for_evaluator(schema, tokenizer_manager, &evaluator)
+    SingleDocumentPreparer::for_fields(schema, tokenizer_manager, fields)
 }
 
 fn text_schema() -> (Schema, Field) {
@@ -1203,8 +1183,7 @@ fn evaluator_evaluates_a_prepared_regular_document() -> crate::Result<()> {
     );
     let mut evaluator = query
         .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
-    let mut preparer =
-        SingleDocumentPreparer::for_evaluator(&schema, index.tokenizers(), evaluator.as_ref())?;
+    let mut preparer = SingleDocumentPreparer::for_fields(&schema, index.tokenizers(), &[field])?;
     let prepared = preparer.prepare(&document)?;
 
     assert_eq!(
@@ -1290,6 +1269,33 @@ fn prepared_document_uses_the_supplied_tokenizer_manager() -> crate::Result<()> 
 }
 
 #[test]
+fn single_document_preparer_normalizes_and_validates_fields() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let title = schema_builder.add_text_field("title", TEXT);
+    let body = schema_builder.add_text_field("body", TEXT);
+    let schema = schema_builder.build();
+    let tokenizer_manager = TokenizerManager::default();
+
+    let mut preparer =
+        SingleDocumentPreparer::for_fields(&schema, &tokenizer_manager, &[body, title, body])?;
+    let document = doc!(title => "Rust", body => "Search");
+    let prepared = preparer.prepare(&document)?;
+    assert!(prepared
+        .term_info(&Term::from_field_text(title, "rust"))
+        .is_some());
+    assert!(prepared
+        .term_info(&Term::from_field_text(body, "search"))
+        .is_some());
+
+    let unknown_field = Field::from_field_id(schema.num_fields() as u32);
+    let error = SingleDocumentPreparer::for_fields(&schema, &tokenizer_manager, &[unknown_field])
+        .err()
+        .unwrap();
+    assert!(matches!(error, TantivyError::SchemaError(_)));
+    Ok(())
+}
+
+#[test]
 fn prepared_document_encodes_numeric_and_json_terms() -> crate::Result<()> {
     let mut schema_builder = Schema::builder();
     let number = schema_builder.add_u64_field("number", INDEXED);
@@ -1363,7 +1369,7 @@ fn single_document_preparer_can_be_reused() -> crate::Result<()> {
 }
 
 #[test]
-fn single_document_preparer_only_indexes_evaluator_fields() -> crate::Result<()> {
+fn single_document_preparer_only_indexes_configured_fields() -> crate::Result<()> {
     let ignored_options = TextOptions::default()
         .set_indexing_options(TextFieldIndexing::default().set_tokenizer("missing_tokenizer"));
     let mut schema_builder = Schema::builder();
@@ -1382,7 +1388,7 @@ fn single_document_preparer_only_indexes_evaluator_fields() -> crate::Result<()>
         Some([queried_field].as_slice())
     );
     let mut preparer =
-        SingleDocumentPreparer::for_evaluator(&schema, &tokenizer_manager, evaluator.as_ref())?;
+        SingleDocumentPreparer::for_fields(&schema, &tokenizer_manager, &[queried_field])?;
     let mut document = TantivyDocument::new();
     document.add_text(queried_field, "Rust search");
     document.add_text(ignored_field, "ignored text");
@@ -1398,27 +1404,6 @@ fn single_document_preparer_only_indexes_evaluator_fields() -> crate::Result<()>
         .term_info(&Term::from_field_text(ignored_field, "ignored"))
         .is_none());
 
-    struct UnknownRequirementsEvaluator;
-    impl SingleDocumentEvaluator for UnknownRequirementsEvaluator {
-        fn evaluate_impl(
-            &mut self,
-            _document: &dyn SingleDocument,
-        ) -> crate::Result<DocumentEvaluation> {
-            Ok(DocumentEvaluation::NoMatch)
-        }
-    }
-    let error = SingleDocumentPreparer::for_evaluator(
-        &schema,
-        &tokenizer_manager,
-        &UnknownRequirementsEvaluator,
-    )
-    .err()
-    .unwrap();
-    assert!(matches!(
-        error,
-        TantivyError::InvalidArgument(message)
-            if message.contains("report exact required fields")
-    ));
     Ok(())
 }
 
@@ -1430,11 +1415,8 @@ fn query_aware_preparer_checks_presence_and_skips_top_level_null() -> crate::Res
     let query = TermQuery::new(Term::from_field_u64(number, 42), IndexRecordOption::Basic);
     let mut evaluator = query
         .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
-    let mut preparer = SingleDocumentPreparer::for_evaluator(
-        &schema,
-        &TokenizerManager::default(),
-        evaluator.as_ref(),
-    )?;
+    let mut preparer =
+        SingleDocumentPreparer::for_fields(&schema, &TokenizerManager::default(), &[number])?;
 
     let missing_error = preparer.prepare(&TantivyDocument::new()).err().unwrap();
     assert!(matches!(
@@ -1502,11 +1484,8 @@ fn query_aware_prepared_document_rejects_broader_evaluator() -> crate::Result<()
     let mut body_evaluator = body_query
         .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
 
-    let mut query_aware_preparer = SingleDocumentPreparer::for_evaluator(
-        &schema,
-        &tokenizer_manager,
-        title_evaluator.as_ref(),
-    )?;
+    let mut query_aware_preparer =
+        SingleDocumentPreparer::for_fields(&schema, &tokenizer_manager, &[title])?;
     let mut document = TantivyDocument::new();
     document.add_text(title, "Rust");
     let query_aware_document = query_aware_preparer.prepare(&document)?;

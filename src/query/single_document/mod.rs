@@ -38,13 +38,13 @@
 //!   evaluation time.
 //!
 //! Callers with regular [`Document`](crate::schema::Document) values should create a query-aware
-//! [`SingleDocumentPreparer`] with [`SingleDocumentPreparer::for_evaluator`], prepare each document
+//! [`SingleDocumentPreparer`] with [`SingleDocumentPreparer::for_fields`], prepare each document
 //! with [`SingleDocumentPreparer::prepare`], and pass the result to
-//! [`SingleDocumentEvaluator::evaluate`]. Query-aware preparation only indexes fields reported by
-//! that evaluator. Every required top-level field must occur at least once in the input document.
-//! Use [`OwnedValue::Null`](crate::schema::OwnedValue::Null) to explicitly represent a required
-//! field that has no value. A top-level `Null` satisfies the presence check but emits no indexed
-//! data.
+//! [`SingleDocumentEvaluator::evaluate`]. Query-aware preparation only indexes the explicitly
+//! listed fields, which must cover every field required by the evaluator. Every required top-level
+//! field must occur at least once in the input document. Use
+//! [`OwnedValue::Null`](crate::schema::OwnedValue::Null) to explicitly represent a required field
+//! that has no value. A top-level `Null` satisfies the presence check but emits no indexed data.
 
 mod prepared_document;
 
@@ -219,8 +219,9 @@ pub trait SingleDocumentEvaluator: Send {
     ///
     /// `Some(fields)` enables query-aware document preparation. `Some(&[])` means that the
     /// evaluator does not inspect document fields. The default `None` means that the requirements
-    /// are unknown, so [`SingleDocumentPreparer::for_evaluator`] cannot safely prepare documents
-    /// for it. The returned set must remain stable for the lifetime of the evaluator.
+    /// are unknown, so the evaluator cannot safely evaluate documents prepared for an explicit
+    /// field subset by [`SingleDocumentPreparer::for_fields`]. The returned set must remain stable
+    /// for the lifetime of the evaluator.
     fn required_fields(&self) -> Option<&[Field]> {
         None
     }
