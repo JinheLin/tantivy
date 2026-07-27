@@ -122,8 +122,8 @@ impl SingleDocumentPreparer {
         for (&field, &was_provided) in self.required_fields.iter().zip(&provided_required_fields) {
             if !was_provided {
                 return Err(TantivyError::InvalidArgument(format!(
-                    "SingleDocumentPreparer requires field {:?} to be explicitly supplied; \
-                     use OwnedValue::Null when it has no value",
+                    "SingleDocumentPreparer requires field {:?} to be explicitly supplied; use \
+                     OwnedValue::Null when it has no value",
                     self.schema.get_field_entry(field).name()
                 )));
             }
@@ -193,7 +193,7 @@ impl SingleDocumentPreparer {
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct PreparedSingleDocument {
-    term_positions: HashMap<Term, Vec<u32>>,
+    term_positions: Vec<(Term, Vec<u32>)>,
     fieldnorm_ids: HashMap<Field, u8>,
     total_num_tokens_by_field: HashMap<Field, u64>,
     prepared_fields: Arc<[Field]>,
@@ -216,11 +216,37 @@ impl PreparedSingleDocument {
 impl SingleDocument for PreparedSingleDocument {
     fn term_info(&self, term: &Term) -> Option<SingleDocumentTermInfo<'_>> {
         self.term_positions
-            .get(term)
+            .binary_search_by(|(candidate, _)| candidate.cmp(term))
+            .ok()
+            .map(|term_index| &self.term_positions[term_index].1)
             .map(|positions| SingleDocumentTermInfo {
                 term_freq: positions.len() as u32,
                 positions: Some(positions.as_slice()),
             })
+    }
+
+    fn visit_terms(
+        &self,
+        field: Field,
+        visitor: &mut dyn FnMut(&Term, SingleDocumentTermInfo<'_>) -> bool,
+    ) {
+        for (term, positions) in &self.term_positions {
+            if term.field() < field {
+                continue;
+            }
+            if term.field() > field {
+                break;
+            }
+            if !visitor(
+                term,
+                SingleDocumentTermInfo {
+                    term_freq: positions.len() as u32,
+                    positions: Some(positions.as_slice()),
+                },
+            ) {
+                break;
+            }
+        }
     }
 
     fn fieldnorm_id(&self, field: Field) -> Option<u8> {
@@ -230,8 +256,8 @@ impl SingleDocument for PreparedSingleDocument {
     fn validate_required_fields(&self, required_fields: Option<&[Field]>) -> crate::Result<()> {
         let Some(required_fields) = required_fields else {
             return Err(TantivyError::InvalidArgument(
-                "PreparedSingleDocument was query-aware, but the evaluator's required fields \
-                 are unknown"
+                "PreparedSingleDocument was query-aware, but the evaluator's required fields are \
+                 unknown"
                     .to_string(),
             ));
         };
@@ -283,7 +309,10 @@ impl PreparedDocumentIndexingOutput {
     }
 
     fn take_prepared_document(&mut self, prepared_fields: Arc<[Field]>) -> PreparedSingleDocument {
-        let term_positions = std::mem::take(&mut self.postings_writer.term_positions);
+        let mut term_positions = std::mem::take(&mut self.postings_writer.term_positions)
+            .into_iter()
+            .collect::<Vec<_>>();
+        term_positions.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         let mut total_num_tokens_by_field = HashMap::new();
         for (term, positions) in &term_positions {
             *total_num_tokens_by_field.entry(term.field()).or_default() += positions.len() as u64;

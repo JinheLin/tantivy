@@ -5,18 +5,22 @@
 //! [`Query::single_document_evaluator`](crate::query::Query::single_document_evaluator) evaluates
 //! pre-tokenized documents without first adding them to an index. Its built-in query support is:
 //!
-//! - Directly supported: `AllQuery`, `EmptyQuery`, and `TermQuery`. `TermQuery` requires the term's
-//!   field to be configured as indexed in the schema. Although evaluation does not read an index,
-//!   it uses the field's postings and fieldnorm settings to match segment scorer semantics.
+//! - Directly supported: `AllQuery`, `EmptyQuery`, `FuzzyTermQuery`, and `TermQuery`.
+//!   `FuzzyTermQuery` and `TermQuery` require the term's field to be configured as indexed in the
+//!   schema. Although evaluation does not read an index, it uses the field's postings and fieldnorm
+//!   settings to match segment scorer semantics.
 //! - Supported with constraints:
 //!   - `PhraseQuery` requires positions from both the field and the `SingleDocument` input.
+//!   - `PhrasePrefixQuery` additionally requires [`SingleDocument::visit_terms`] to expose all
+//!     indexed terms in sorted order. Its `max_expansions` limit applies to matching terms in the
+//!     evaluated document because no segment term dictionary is available.
 //! - Composite queries: `BooleanQuery` requires every evaluated child query to be supported.
 //! - `BooleanQuery` compilation skips `Should` clauses when scoring is disabled and at least one
 //!   `Must` clause exists, because `Should` cannot affect the match in that case. An unsupported
 //!   query in a skipped `Should` clause therefore does not cause compilation to fail.
 //! - Wrapper queries: `BoostQuery` and `ConstScoreQuery` require the wrapped query to be supported.
-//! - Common unsupported queries: `DisjunctionMaxQuery`, `TermSetQuery`, `RegexQuery`,
-//!   `FuzzyTermQuery`, `RangeQuery`, `ExistsQuery`, `MoreLikeThisQuery`, and `PhrasePrefixQuery`.
+//! - Common unsupported queries: `DisjunctionMaxQuery`, `TermSetQuery`, `RegexQuery`, `RangeQuery`,
+//!   `ExistsQuery`, and `MoreLikeThisQuery`.
 //!
 //! The unsupported list is not exhaustive. Any query implementation that does not override
 //! [`Query::single_document_evaluator`](crate::query::Query::single_document_evaluator) returns
@@ -60,10 +64,10 @@ pub struct SingleDocumentTermInfo<'a> {
     pub term_freq: u32,
     /// Tantivy postings positions for this term.
     ///
-    /// Positions are required only when evaluating a [`PhraseQuery`](crate::query::PhraseQuery).
-    /// Other supported query types ignore them, so callers may use `None`. When required,
-    /// positions must be sorted absolute token positions and their length must equal
-    /// `term_freq`.
+    /// Positions are required only when evaluating a [`PhraseQuery`](crate::query::PhraseQuery) or
+    /// [`PhrasePrefixQuery`](crate::query::PhrasePrefixQuery). Other supported query types ignore
+    /// them, so callers may use `None`. When required, positions must be sorted absolute token
+    /// positions and their length must equal `term_freq`.
     pub positions: Option<&'a [u32]>,
 }
 
@@ -77,11 +81,25 @@ pub trait SingleDocument {
     /// Returns occurrence information for `term`, or `None` when the term is absent.
     fn term_info(&self, term: &Term) -> Option<SingleDocumentTermInfo<'_>>;
 
+    /// Visits every indexed term for `field` in ascending [`Term`] order.
+    ///
+    /// Each distinct term must be visited exactly once unless `visitor` returns `false` to stop
+    /// iteration early. The supplied term information follows the same invariants as
+    /// [`Self::term_info`]. Automaton and prefix queries use this method because they cannot know
+    /// all matching terms in advance.
+    fn visit_terms(
+        &self,
+        field: Field,
+        visitor: &mut dyn FnMut(&Term, SingleDocumentTermInfo<'_>) -> bool,
+    );
+
     /// Returns the compressed fieldnorm id for `field`.
     ///
     /// `None` means the caller did not supply a fieldnorm for this field. A fieldnorm is required
-    /// only when scoring a [`TermQuery`](crate::query::TermQuery) or
-    /// [`PhraseQuery`](crate::query::PhraseQuery) on a field configured with fieldnorms.
+    /// only when scoring a [`TermQuery`](crate::query::TermQuery),
+    /// [`PhraseQuery`](crate::query::PhraseQuery), or
+    /// [`PhrasePrefixQuery`](crate::query::PhrasePrefixQuery) on a field configured with
+    /// fieldnorms.
     fn fieldnorm_id(&self, field: Field) -> Option<u8>;
 
     /// Validates that this document contains the fields an evaluator may read.
