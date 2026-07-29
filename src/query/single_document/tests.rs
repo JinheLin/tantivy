@@ -408,6 +408,72 @@ fn single_document_phrase_prefix_score_matches_segment_scorer() -> crate::Result
 }
 
 #[test]
+fn single_document_phrase_prefix_with_non_adjacent_offsets_matches_segment_scorer(
+) -> crate::Result<()> {
+    let (schema, field) = text_schema();
+    let index = Index::create_in_ram(schema.clone());
+    let mut writer: IndexWriter = index.writer_for_tests()?;
+    writer.add_document(doc!(field => "a x b cat"))?;
+    writer.add_document(doc!(field => "d x dog"))?;
+    writer.commit()?;
+    let searcher = index.reader()?.searcher();
+
+    let term = |text| Term::from_field_text(field, text);
+    let cases = [
+        // Preserve a gap between the fixed terms while keeping the prefix immediately after the
+        // greatest fixed-term offset, as the segment scorer's multi-fixed-term path expects.
+        (
+            PhrasePrefixQuery::new_with_offset(vec![
+                (0, term("a")),
+                (2, term("b")),
+                (3, term("c")),
+            ]),
+            0,
+            "a x b cat",
+            "a b cat",
+        ),
+        // The segment scorer's single-fixed-term path aligns directly to the explicit prefix
+        // offset, so exercise a gap between that fixed term and the prefix as well.
+        (
+            PhrasePrefixQuery::new_with_offset(vec![(0, term("d")), (2, term("do"))]),
+            1,
+            "d x dog",
+            "d dog",
+        ),
+    ];
+    let mut preparer = preparer_for_fields(&schema, index.tokenizers(), &[field])?;
+
+    for (query, expected_doc, matching_text, non_matching_text) in cases {
+        let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+        let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+        assert_eq!(scorer.doc(), expected_doc);
+        let expected_score = scorer.score();
+        assert_eq!(scorer.advance(), TERMINATED);
+
+        let mut matching_document = TantivyDocument::new();
+        matching_document.add_text(field, matching_text);
+        let matching_prepared = preparer.prepare(&matching_document)?;
+        let mut non_matching_document = TantivyDocument::new();
+        non_matching_document.add_text(field, non_matching_text);
+        let non_matching_prepared = preparer.prepare(&non_matching_document)?;
+        let mut evaluator = query.single_document_evaluator(
+            SingleDocumentEvaluationContext::with_scoring(&schema, &searcher),
+        )?;
+
+        let DocumentEvaluation::Match(actual_score) = evaluator.evaluate(&matching_prepared)?
+        else {
+            panic!("phrase prefix query with non-adjacent offsets should match");
+        };
+        assert!((actual_score - expected_score).abs() <= 1e-6);
+        assert_eq!(
+            evaluator.evaluate(&non_matching_prepared)?,
+            DocumentEvaluation::NoMatch
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn single_document_phrase_prefix_honors_document_expansion_order() -> crate::Result<()> {
     let (schema, field) = text_schema();
     let index = Index::create_in_ram(schema.clone());
