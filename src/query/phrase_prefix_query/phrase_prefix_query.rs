@@ -246,9 +246,13 @@ impl Query for PhrasePrefixQuery {
             }
         }
 
-        // `PhrasePrefixScorer` scores the fixed phrase and only uses the prefix expansion as a
-        // match filter. Its one-fixed-term specialization returns a constant score.
-        let bm25_weight = if self.phrase_terms.len() > 1 {
+        // Keep single-document evaluation consistent with the segment-index
+        // `PhrasePrefixScorer`. Its one-fixed-term branch shifts that term directly to the prefix
+        // offset and returns a constant score. Its multi-fixed-term branch delegates to a
+        // `PhraseScorer`, which aligns the fixed phrase one position after its greatest offset and
+        // BM25-scores it; the expanded prefix only filters matches.
+        let has_multiple_fixed_terms = self.phrase_terms.len() > 1;
+        let bm25_weight = if has_multiple_fixed_terms {
             context
                 .statistics_provider()
                 .map(|statistics| -> crate::Result<Bm25Weight> {
@@ -265,14 +269,14 @@ impl Query for PhrasePrefixQuery {
             .map(|(offset, _)| *offset)
             .max()
             .unwrap_or(0);
-        let fixed_position_target = if self.phrase_terms.len() == 1 {
-            self.prefix.0
-        } else {
+        let fixed_position_target = if has_multiple_fixed_terms {
             max_fixed_offset.checked_add(1).ok_or_else(|| {
                 TantivyError::InvalidArgument(
                     "PhrasePrefixQuery position offset exceeds usize::MAX".to_string(),
                 )
             })?
+        } else {
+            self.prefix.0
         };
         let max_offset = max_fixed_offset.max(self.prefix.0);
         Ok(Box::new(PhrasePrefixSingleDocumentEvaluator {
@@ -287,7 +291,7 @@ impl Query for PhrasePrefixQuery {
                 )
             })?,
             adjusted_positions: vec![Vec::new(); self.phrase_terms.len()],
-            matcher: (self.phrase_terms.len() > 1)
+            matcher: has_multiple_fixed_terms
                 .then(|| PhraseMatcher::new(self.phrase_terms.len(), 0)),
             suffix_positions: Vec::new(),
             bm25_weight,
