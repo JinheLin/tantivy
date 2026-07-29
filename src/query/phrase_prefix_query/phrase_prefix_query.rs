@@ -245,11 +245,16 @@ impl Query for PhrasePrefixQuery {
             }
         }
 
-        // Keep single-document evaluation consistent with the segment-index
-        // `PhrasePrefixScorer`. Its one-fixed-term branch shifts that term directly to the prefix
-        // offset and returns a constant score. Its multi-fixed-term branch delegates to a
-        // `PhraseScorer`, which aligns the fixed phrase one position after its greatest offset and
-        // BM25-scores it; the expanded prefix only filters matches.
+        // Mirror the existing segment-index `PhrasePrefixScorer` behavior rather than define a new
+        // single-document scoring policy. `PhraseScorer` requires at least two fixed-term postings
+        // because its underlying `Intersection` does, so the segment path specializes the
+        // one-fixed-term case: it shifts that term directly to the prefix offset and returns a
+        // constant score. The multi-fixed-term branch delegates to `PhraseScorer`, which aligns
+        // the fixed phrase one position after its greatest offset and BM25-scores it; the expanded
+        // prefix only filters matches. This scoring split is specific to Tantivy's current
+        // implementation: `PhrasePrefixScorer::score` still has a TODO to revisit prefix scoring,
+        // so preserve it here for compatibility rather than treating it as general phrase-prefix
+        // semantics.
         let has_multiple_fixed_terms = self.phrase_terms.len() > 1;
         let bm25_weight = if has_multiple_fixed_terms {
             context
