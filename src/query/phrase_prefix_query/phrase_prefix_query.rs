@@ -205,7 +205,6 @@ impl Query for PhrasePrefixQuery {
                 prefix: self.prefix.1.clone(),
                 max_expansions: self.max_expansions,
                 fixed_position_target: 0,
-                suffix_position_offset: 0,
                 adjusted_positions: Vec::new(),
                 matcher: None,
                 suffix_positions: Vec::new(),
@@ -263,12 +262,9 @@ impl Query for PhrasePrefixQuery {
         } else {
             None
         };
-        let max_fixed_offset = self
-            .phrase_terms
-            .iter()
-            .map(|(offset, _)| *offset)
-            .max()
-            .unwrap_or(0);
+        // `new_with_offset` sorts by offset and removes the greatest entry as the prefix, so the
+        // suffix is already at the maximum query offset and does not need an additional shift.
+        let max_fixed_offset = self.phrase_terms.last().unwrap().0;
         let fixed_position_target = if has_multiple_fixed_terms {
             max_fixed_offset.checked_add(1).ok_or_else(|| {
                 TantivyError::InvalidArgument(
@@ -278,18 +274,12 @@ impl Query for PhrasePrefixQuery {
         } else {
             self.prefix.0
         };
-        let max_offset = max_fixed_offset.max(self.prefix.0);
         Ok(Box::new(PhrasePrefixSingleDocumentEvaluator {
             field: self.field,
             phrase_terms: self.phrase_terms.clone(),
             prefix: self.prefix.1.clone(),
             max_expansions: self.max_expansions,
             fixed_position_target,
-            suffix_position_offset: u32::try_from(max_offset - self.prefix.0).map_err(|_| {
-                TantivyError::InvalidArgument(
-                    "PhrasePrefixQuery position offset exceeds u32::MAX".to_string(),
-                )
-            })?,
             adjusted_positions: vec![Vec::new(); self.phrase_terms.len()],
             matcher: has_multiple_fixed_terms
                 .then(|| PhraseMatcher::new(self.phrase_terms.len(), 0)),
@@ -313,7 +303,6 @@ struct PhrasePrefixSingleDocumentEvaluator {
     prefix: Term,
     max_expansions: u32,
     fixed_position_target: usize,
-    suffix_position_offset: u32,
     adjusted_positions: Vec<Vec<u32>>,
     matcher: Option<PhraseMatcher>,
     suffix_positions: Vec<u32>,
@@ -383,12 +372,9 @@ impl PhrasePrefixSingleDocumentEvaluator {
                 }
                 return true;
             }
-            if let Err(current_error) = validated_positions(
-                term,
-                term_info,
-                self.suffix_position_offset as usize,
-                &mut self.suffix_positions,
-            ) {
+            if let Err(current_error) =
+                validated_positions(term, term_info, 0, &mut self.suffix_positions)
+            {
                 error = Some(current_error);
                 return false;
             }
