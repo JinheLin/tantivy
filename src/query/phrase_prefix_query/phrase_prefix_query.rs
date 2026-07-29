@@ -171,6 +171,29 @@ impl Query for PhrasePrefixQuery {
         &self,
         context: SingleDocumentEvaluationContext<'_>,
     ) -> crate::Result<Box<dyn SingleDocumentEvaluator>> {
+        if self.field.field_id() as usize >= context.schema().num_fields() {
+            return Err(TantivyError::SchemaError(format!(
+                "Field id {} does not exist in the schema",
+                self.field.field_id()
+            )));
+        }
+        let field_entry = context.schema().get_field_entry(self.field);
+        let field_type = field_entry.field_type();
+        let value_type = field_type.value_type();
+        for (_, term) in self
+            .phrase_terms
+            .iter()
+            .chain(std::iter::once(&self.prefix))
+        {
+            if value_type != term.typ() {
+                return Err(TantivyError::SchemaError(format!(
+                    "Create a phrase prefix query of the type {:?}, when the field given was of \
+                     type {value_type:?}",
+                    term.typ()
+                )));
+            }
+        }
+
         if self.phrase_terms.is_empty() {
             // Prefix-only evaluation only needs term presence (Basic). Validate schema
             // compatibility at compile time; the returned record option and fieldnorm flag
@@ -196,14 +219,6 @@ impl Query for PhrasePrefixQuery {
             }));
         }
 
-        if self.field.field_id() as usize >= context.schema().num_fields() {
-            return Err(TantivyError::SchemaError(format!(
-                "Field id {} does not exist in the schema",
-                self.field.field_id()
-            )));
-        }
-        let field_entry = context.schema().get_field_entry(self.field);
-        let field_type = field_entry.field_type();
         let schema_record_option = field_type.index_record_option().ok_or_else(|| {
             TantivyError::SchemaError(format!("Field {:?} is not indexed.", field_entry.name()))
         })?;

@@ -485,6 +485,32 @@ fn single_term_phrase_prefix_does_not_require_positions() -> crate::Result<()> {
 }
 
 #[test]
+fn single_document_phrase_prefix_rejects_mismatched_term_type() {
+    let (schema, field) = text_schema();
+    let text_term = Term::from_field_text(field, "rust");
+    let u64_term = Term::from_field_u64(field, 42);
+    let queries = [
+        PhrasePrefixQuery::new(vec![u64_term.clone()]),
+        PhrasePrefixQuery::new(vec![u64_term.clone(), text_term.clone()]),
+        PhrasePrefixQuery::new(vec![text_term, u64_term]),
+    ];
+
+    for query in queries {
+        let error = query
+            .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            error,
+            TantivyError::SchemaError(message)
+                if message
+                    == "Create a phrase prefix query of the type U64, when the field given was of \
+                        type Str"
+        ));
+    }
+}
+
+#[test]
 fn single_term_phrase_prefix_score_matches_segment_range_query() -> crate::Result<()> {
     let mut schema_builder = Schema::builder();
     let field = schema_builder.add_text_field("body", STRING);
