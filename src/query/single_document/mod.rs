@@ -13,7 +13,11 @@
 //!   - `PhraseQuery` requires positions from both the field and the `SingleDocument` input.
 //!   - `PhrasePrefixQuery` additionally requires [`SingleDocument::visit_terms`] to expose all
 //!     indexed terms in sorted order. Its `max_expansions` limit applies to matching terms in the
-//!     evaluated document because no segment term dictionary is available.
+//!     evaluated document because no segment term dictionary is available. This can differ from
+//!     segment evaluation when the limit is reached. For example, with `max_expansions = 1`, a
+//!     segment dictionary containing `[ca, cb]` expands `c*` to `ca`, while a document containing
+//!     only `cb` expands it to `cb` during single-document evaluation. A query such as `"x c*"`
+//!     can therefore match an external `"x cb"` document even though the segment scorer would not.
 //! - Composite queries: `BooleanQuery` requires every evaluated child query to be supported.
 //! - `BooleanQuery` compilation skips `Should` clauses when scoring is disabled and at least one
 //!   `Must` clause exists, because `Should` cannot affect the match in that case. An unsupported

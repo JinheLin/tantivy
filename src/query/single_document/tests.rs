@@ -485,6 +485,43 @@ fn single_term_phrase_prefix_does_not_require_positions() -> crate::Result<()> {
 }
 
 #[test]
+fn single_term_phrase_prefix_score_matches_segment_range_query() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let field = schema_builder.add_text_field("body", STRING);
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema.clone());
+    let mut writer: IndexWriter = index.writer_for_tests()?;
+    writer.add_document(doc!(field => "rust"))?;
+    writer.commit()?;
+    let searcher = index.reader()?.searcher();
+
+    let query = BoostQuery::new(
+        Box::new(PhrasePrefixQuery::new(vec![Term::from_field_text(
+            field, "rus",
+        )])),
+        2.5,
+    );
+    let weight = query.weight(EnableScoring::enabled_from_searcher(&searcher))?;
+    let mut scorer = weight.scorer(searcher.segment_reader(0), 1.0)?;
+    assert_eq!(scorer.doc(), 0);
+    let expected_score = scorer.score();
+
+    let mut document = TantivyDocument::new();
+    document.add_text(field, "rust");
+    let mut preparer = preparer_for_fields(&schema, index.tokenizers(), &[field])?;
+    let prepared = preparer.prepare(&document)?;
+    let mut evaluator = query.single_document_evaluator(
+        SingleDocumentEvaluationContext::with_scoring(&schema, &searcher),
+    )?;
+    let DocumentEvaluation::Match(actual_score) = evaluator.evaluate(&prepared)? else {
+        panic!("prefix-only phrase prefix query should match");
+    };
+    assert_eq!(actual_score, expected_score);
+    assert_eq!(actual_score, 2.5);
+    Ok(())
+}
+
+#[test]
 fn term_score_without_fieldnorms_matches_segment_scorer() -> crate::Result<()> {
     let text_options = TextOptions::default().set_indexing_options(
         TextFieldIndexing::default()
