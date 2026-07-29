@@ -172,6 +172,9 @@ impl Query for PhrasePrefixQuery {
         context: SingleDocumentEvaluationContext<'_>,
     ) -> crate::Result<Box<dyn SingleDocumentEvaluator>> {
         if self.phrase_terms.is_empty() {
+            // Prefix-only evaluation only needs term presence (Basic). Validate schema
+            // compatibility at compile time; the returned record option and fieldnorm flag
+            // are unused because this path scores with `prefix_only_score`, not BM25.
             effective_record_option(context.schema(), &self.prefix.1, IndexRecordOption::Basic)?;
             return Ok(Box::new(PhrasePrefixSingleDocumentEvaluator {
                 field: self.field,
