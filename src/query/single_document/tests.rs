@@ -309,6 +309,44 @@ fn single_document_fuzzy_evaluation_matches_segment_scorer() -> crate::Result<()
 }
 
 #[test]
+fn single_document_fuzzy_json_path_is_filtered() -> crate::Result<()> {
+    let mut schema_builder = Schema::builder();
+    let attributes = schema_builder.add_json_field("attributes", TEXT);
+    let schema = schema_builder.build();
+    let index = Index::create_in_ram(schema.clone());
+    let document = doc!(attributes => serde_json::json!({"a": "japan"}));
+    let mut preparer = preparer_for_fields(&schema, index.tokenizers(), &[attributes])?;
+    let prepared = preparer.prepare(&document)?;
+
+    let json_term = |path: &str, text: &str| {
+        let mut term = Term::with_type_and_field(Type::Json, attributes);
+        let mut writer = JsonTermWriter::wrap(&mut term, false);
+        writer.push_path_segment(path);
+        writer.set_str(text);
+        drop(writer);
+        term
+    };
+
+    // The extra `a` in the JSON path is within the fuzzy distance, but paths must be exact.
+    let wrong_path_query = FuzzyTermQuery::new(json_term("aa", "japan"), 2, true);
+    let mut wrong_path_evaluator = wrong_path_query
+        .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
+    assert_eq!(
+        wrong_path_evaluator.evaluate(&prepared)?,
+        DocumentEvaluation::NoMatch
+    );
+
+    let matching_query = FuzzyTermQuery::new(json_term("a", "japon"), 1, true);
+    let mut matching_evaluator = matching_query
+        .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
+    assert_eq!(
+        matching_evaluator.evaluate(&prepared)?,
+        DocumentEvaluation::Match(1.0)
+    );
+    Ok(())
+}
+
+#[test]
 fn single_document_phrase_prefix_score_matches_segment_scorer() -> crate::Result<()> {
     let (schema, field) = text_schema();
     let index = Index::create_in_ram(schema.clone());
@@ -372,6 +410,58 @@ fn single_document_phrase_prefix_honors_document_expansion_order() -> crate::Res
         DocumentEvaluation::Match(1.0)
     );
     Ok(())
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "strictly ascending order")]
+fn single_document_phrase_prefix_debug_asserts_visit_terms_order() {
+    struct UnsortedTermsDocument {
+        terms: Vec<Term>,
+    }
+
+    impl SingleDocument for UnsortedTermsDocument {
+        fn term_info(&self, _term: &Term) -> Option<SingleDocumentTermInfo<'_>> {
+            None
+        }
+
+        fn fieldnorm_id(&self, _field: Field) -> Option<u8> {
+            None
+        }
+
+        fn visit_terms(
+            &self,
+            _field: Field,
+            visitor: &mut dyn FnMut(&Term, SingleDocumentTermInfo<'_>) -> bool,
+        ) {
+            for term in &self.terms {
+                if !visitor(
+                    term,
+                    SingleDocumentTermInfo {
+                        term_freq: 1,
+                        positions: None,
+                    },
+                ) {
+                    break;
+                }
+            }
+        }
+    }
+
+    let (schema, field) = text_schema();
+    let mut query = PhrasePrefixQuery::new(vec![Term::from_field_text(field, "c")]);
+    query.set_max_expansions(1);
+    let mut evaluator = query
+        .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))
+        .unwrap();
+    let document = UnsortedTermsDocument {
+        terms: vec![
+            Term::from_field_text(field, "cb"),
+            Term::from_field_text(field, "ca"),
+        ],
+    };
+
+    let _ = evaluator.evaluate(&document);
 }
 
 #[test]

@@ -331,10 +331,22 @@ impl PhrasePrefixSingleDocumentEvaluator {
         self.suffix_positions.clear();
         let mut num_expansions = 0u32;
         let mut error = None;
+        #[cfg(debug_assertions)]
+        let mut previous_term = None;
         let prefix_bytes = self.prefix.serialized_value_bytes();
         let needs_positions = !self.phrase_terms.is_empty();
         document.visit_terms(self.field, &mut |term, term_info| {
-            if error.is_some() || num_expansions >= self.max_expansions {
+            #[cfg(debug_assertions)]
+            debug_assert_visit_terms_order(&mut previous_term, term);
+            if error.is_some() {
+                return false;
+            }
+            if num_expansions >= self.max_expansions {
+                // Keep visiting in debug builds so an ordering violation after the expansion limit
+                // is not hidden by the early exit that release builds retain.
+                #[cfg(debug_assertions)]
+                return true;
+                #[cfg(not(debug_assertions))]
                 return false;
             }
             if !term.serialized_value_bytes().starts_with(prefix_bytes) {
@@ -373,6 +385,18 @@ impl PhrasePrefixSingleDocumentEvaluator {
         self.suffix_positions.sort_unstable();
         Ok(num_expansions > 0)
     }
+}
+
+#[cfg(debug_assertions)]
+fn debug_assert_visit_terms_order(previous_term: &mut Option<Term>, term: &Term) {
+    if let Some(previous_term) = previous_term.as_ref() {
+        debug_assert!(
+            previous_term < term,
+            "SingleDocument::visit_terms must visit distinct terms in strictly ascending order; \
+             previous term {previous_term:?}, current term {term:?}"
+        );
+    }
+    *previous_term = Some(term.clone());
 }
 
 impl SingleDocumentEvaluator for PhrasePrefixSingleDocumentEvaluator {

@@ -73,10 +73,15 @@ pub struct SingleDocumentTermInfo<'a> {
 
 /// A pre-tokenized view of one external document.
 ///
-/// Positions may be omitted except when evaluating a [`PhraseQuery`](crate::query::PhraseQuery).
-/// Phrase positions use Tantivy postings semantics: they are sorted absolute token positions
-/// including indexing-time position gaps or offsets, and must not have phrase-query offsets applied
-/// in advance. Their length must equal `term_freq`.
+/// Positions may be omitted except when evaluating a [`PhraseQuery`](crate::query::PhraseQuery) or
+/// [`PhrasePrefixQuery`](crate::query::PhrasePrefixQuery). Phrase positions use Tantivy postings
+/// semantics: they are sorted absolute token positions including indexing-time position gaps or
+/// offsets, and must not have phrase-query offsets applied in advance. Their length must equal
+/// `term_freq`.
+///
+/// [`PhrasePrefixQuery`](crate::query::PhrasePrefixQuery) additionally requires
+/// [`Self::visit_terms`] to expose every indexed term for the target field in ascending
+/// [`Term`] order.
 pub trait SingleDocument {
     /// Returns occurrence information for `term`, or `None` when the term is absent.
     fn term_info(&self, term: &Term) -> Option<SingleDocumentTermInfo<'_>>;
@@ -85,8 +90,9 @@ pub trait SingleDocument {
     ///
     /// Each distinct term must be visited exactly once unless `visitor` returns `false` to stop
     /// iteration early. The supplied term information follows the same invariants as
-    /// [`Self::term_info`]. Automaton and prefix queries use this method because they cannot know
-    /// all matching terms in advance.
+    /// [`Self::term_info`]. [`PhrasePrefixQuery`](crate::query::PhrasePrefixQuery)
+    /// single-document evaluation debug-asserts the strict ordering requirement. Automaton and
+    /// prefix queries use this method because they cannot know all matching terms in advance.
     fn visit_terms(
         &self,
         field: Field,
