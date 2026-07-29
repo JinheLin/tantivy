@@ -352,8 +352,18 @@ impl PhrasePrefixSingleDocumentEvaluator {
         #[cfg(debug_assertions)]
         let mut previous_term = None;
         let prefix_bytes = self.prefix.serialized_value_bytes();
+        let end_term = prefix_end(prefix_bytes).map(|end_value| {
+            let mut end_term = Term::with_capacity(end_value.len());
+            end_term.set_field_and_type(self.field, self.prefix.typ());
+            end_term.append_bytes(&end_value);
+            end_term
+        });
+        let range_end = end_term
+            .as_ref()
+            .map(Bound::Excluded)
+            .unwrap_or(Bound::Unbounded);
         let needs_positions = !self.phrase_terms.is_empty();
-        document.visit_terms(self.field, &mut |term, term_info| {
+        let mut visitor = |term: &Term, term_info: crate::query::SingleDocumentTermInfo<'_>| {
             #[cfg(debug_assertions)]
             debug_assert_visit_terms_order(&mut previous_term, term);
             if error.is_some() {
@@ -396,7 +406,12 @@ impl PhrasePrefixSingleDocumentEvaluator {
                 self.suffix_positions.push(adjusted);
             }
             true
-        });
+        };
+        document.visit_terms(
+            self.field,
+            (Bound::Included(&self.prefix), range_end),
+            &mut visitor,
+        );
         if let Some(error) = error {
             return Err(error);
         }

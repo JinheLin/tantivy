@@ -11,13 +11,14 @@
 //!   settings to match segment scorer semantics.
 //! - Supported with constraints:
 //!   - `PhraseQuery` requires positions from both the field and the `SingleDocument` input.
-//!   - `PhrasePrefixQuery` additionally requires [`SingleDocument::visit_terms`] to expose all
-//!     indexed terms in sorted order. Its `max_expansions` limit applies to matching terms in the
-//!     evaluated document because no segment term dictionary is available. This can differ from
-//!     segment evaluation when the limit is reached. For example, with `max_expansions = 1`, a
-//!     segment dictionary containing `[ca, cb]` expands `c*` to `ca`, while a document containing
-//!     only `cb` expands it to `cb` during single-document evaluation. A query such as `"x c*"`
-//!     can therefore match an external `"x cb"` document even though the segment scorer would not.
+//!   - `PhrasePrefixQuery` additionally requires [`SingleDocument::visit_terms`] to expose indexed
+//!     terms in requested ranges in sorted order. Its `max_expansions` limit applies to matching
+//!     terms in the evaluated document because no segment term dictionary is available. This can
+//!     differ from segment evaluation when the limit is reached. For example, set `max_expansions`
+//!     to `1`. A segment dictionary containing `[ca, cb]` expands `c*` to `ca`, while a document
+//!     containing only `cb` expands it to `cb` during single-document evaluation. A query such as
+//!     `"x c*"` can therefore match an external `"x cb"` document even though the segment scorer
+//!     would not.
 //! - Composite queries: `BooleanQuery` requires every evaluated child query to be supported.
 //! - `BooleanQuery` compilation skips `Should` clauses when scoring is disabled and at least one
 //!   `Must` clause exists, because `Should` cannot affect the match in that case. An unsupported
@@ -54,6 +55,8 @@
 //! [`OwnedValue::Null`](crate::schema::OwnedValue::Null) to explicitly represent a required field
 //! that has no value. A top-level `Null` satisfies the presence check but emits no indexed data.
 
+use std::ops::Bound;
+
 mod prepared_document;
 
 pub use self::prepared_document::{PreparedSingleDocument, SingleDocumentPreparer};
@@ -84,22 +87,24 @@ pub struct SingleDocumentTermInfo<'a> {
 /// `term_freq`.
 ///
 /// [`PhrasePrefixQuery`](crate::query::PhrasePrefixQuery) additionally requires
-/// [`Self::visit_terms`] to expose every indexed term for the target field in ascending
-/// [`Term`] order.
+/// [`Self::visit_terms`] to expose every indexed term in the requested range in ascending [`Term`]
+/// order.
 pub trait SingleDocument {
     /// Returns occurrence information for `term`, or `None` when the term is absent.
     fn term_info(&self, term: &Term) -> Option<SingleDocumentTermInfo<'_>>;
 
-    /// Visits every indexed term for `field` in ascending [`Term`] order.
+    /// Visits every indexed term for `field` within `range` in ascending [`Term`] order.
     ///
-    /// Each distinct term must be visited exactly once unless `visitor` returns `false` to stop
-    /// iteration early. The supplied term information follows the same invariants as
-    /// [`Self::term_info`]. [`PhrasePrefixQuery`](crate::query::PhrasePrefixQuery)
-    /// single-document evaluation debug-asserts the strict ordering requirement. Automaton and
-    /// prefix queries use this method because they cannot know all matching terms in advance.
+    /// Bounds use the natural [`Term`] ordering. Each distinct term in the range must be visited
+    /// exactly once unless `visitor` returns `false` to stop iteration early. The supplied term
+    /// information follows the same invariants as [`Self::term_info`].
+    /// [`PhrasePrefixQuery`](crate::query::PhrasePrefixQuery) single-document evaluation
+    /// debug-asserts the strict ordering requirement. Automaton and prefix queries use this method
+    /// because they cannot know all matching terms in advance.
     fn visit_terms(
         &self,
         field: Field,
+        range: (Bound<&Term>, Bound<&Term>),
         visitor: &mut dyn FnMut(&Term, SingleDocumentTermInfo<'_>) -> bool,
     );
 

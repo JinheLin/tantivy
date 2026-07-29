@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Bound;
 
 use super::{
     DocumentEvaluation, SingleDocument, SingleDocumentEvaluationContext, SingleDocumentEvaluator,
@@ -63,6 +64,7 @@ impl SingleDocument for TestDocument {
     fn visit_terms(
         &self,
         field: Field,
+        range: (Bound<&Term>, Bound<&Term>),
         visitor: &mut dyn FnMut(&Term, SingleDocumentTermInfo<'_>) -> bool,
     ) {
         let mut terms = self
@@ -72,6 +74,22 @@ impl SingleDocument for TestDocument {
             .collect::<Vec<_>>();
         terms.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
         for (term, &term_freq) in terms {
+            let after_start = match range.0 {
+                Bound::Included(start) => term >= start,
+                Bound::Excluded(start) => term > start,
+                Bound::Unbounded => true,
+            };
+            if !after_start {
+                continue;
+            }
+            let before_end = match range.1 {
+                Bound::Included(end) => term <= end,
+                Bound::Excluded(end) => term < end,
+                Bound::Unbounded => true,
+            };
+            if !before_end {
+                break;
+            }
             if !visitor(
                 term,
                 SingleDocumentTermInfo {
@@ -412,6 +430,61 @@ fn single_document_phrase_prefix_honors_document_expansion_order() -> crate::Res
     Ok(())
 }
 
+#[test]
+fn single_document_phrase_prefix_bounds_term_visit_to_prefix() -> crate::Result<()> {
+    struct RangeCheckingDocument {
+        field: Field,
+        prefix: Term,
+        end: Term,
+        matching_term: Term,
+    }
+
+    impl SingleDocument for RangeCheckingDocument {
+        fn term_info(&self, _term: &Term) -> Option<SingleDocumentTermInfo<'_>> {
+            None
+        }
+
+        fn fieldnorm_id(&self, _field: Field) -> Option<u8> {
+            None
+        }
+
+        fn visit_terms(
+            &self,
+            field: Field,
+            range: (Bound<&Term>, Bound<&Term>),
+            visitor: &mut dyn FnMut(&Term, SingleDocumentTermInfo<'_>) -> bool,
+        ) {
+            assert_eq!(field, self.field);
+            assert!(matches!(range.0, Bound::Included(term) if term == &self.prefix));
+            assert!(matches!(range.1, Bound::Excluded(term) if term == &self.end));
+            visitor(
+                &self.matching_term,
+                SingleDocumentTermInfo {
+                    term_freq: 1,
+                    positions: None,
+                },
+            );
+        }
+    }
+
+    let (schema, field) = text_schema();
+    let prefix = Term::from_field_text(field, "ca");
+    let document = RangeCheckingDocument {
+        field,
+        prefix: prefix.clone(),
+        end: Term::from_field_text(field, "cb"),
+        matching_term: Term::from_field_text(field, "cable"),
+    };
+    let query = PhrasePrefixQuery::new(vec![prefix]);
+    let mut evaluator = query
+        .single_document_evaluator(SingleDocumentEvaluationContext::without_scoring(&schema))?;
+    assert_eq!(
+        evaluator.evaluate(&document)?,
+        DocumentEvaluation::Match(1.0)
+    );
+    Ok(())
+}
+
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "strictly ascending order")]
@@ -432,6 +505,7 @@ fn single_document_phrase_prefix_debug_asserts_visit_terms_order() {
         fn visit_terms(
             &self,
             _field: Field,
+            _range: (Bound<&Term>, Bound<&Term>),
             visitor: &mut dyn FnMut(&Term, SingleDocumentTermInfo<'_>) -> bool,
         ) {
             for term in &self.terms {
@@ -1475,6 +1549,34 @@ fn prepared_document_matches_text_indexing_semantics() -> crate::Result<()> {
         panic!("prepared document should match");
     };
     assert!((actual_score - expected_score).abs() <= 1e-6);
+    Ok(())
+}
+
+#[test]
+fn prepared_document_visit_terms_honors_range() -> crate::Result<()> {
+    let (schema, field) = text_schema();
+    let index = Index::create_in_ram(schema.clone());
+    let document = doc!(field => "aa ab ac ba");
+    let mut preparer = preparer_for_fields(&schema, index.tokenizers(), &[field])?;
+    let prepared = preparer.prepare(&document)?;
+    let lower = Term::from_field_text(field, "ab");
+    let upper = Term::from_field_text(field, "ba");
+    let mut visited = Vec::new();
+    prepared.visit_terms(
+        field,
+        (Bound::Excluded(&lower), Bound::Included(&upper)),
+        &mut |term, _| {
+            visited.push(term.clone());
+            true
+        },
+    );
+    assert_eq!(
+        visited,
+        vec![
+            Term::from_field_text(field, "ac"),
+            Term::from_field_text(field, "ba")
+        ]
+    );
     Ok(())
 }
 

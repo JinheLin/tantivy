@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use common::JsonPathWriter;
@@ -228,15 +229,31 @@ impl SingleDocument for PreparedSingleDocument {
     fn visit_terms(
         &self,
         field: Field,
+        range: (Bound<&Term>, Bound<&Term>),
         visitor: &mut dyn FnMut(&Term, SingleDocumentTermInfo<'_>) -> bool,
     ) {
-        for (term, positions) in &self.term_positions {
-            if term.field() < field {
-                continue;
-            }
-            if term.field() > field {
-                break;
-            }
+        let field_start = self
+            .term_positions
+            .partition_point(|(term, _)| term.field() < field);
+        let field_end = field_start
+            + self.term_positions[field_start..].partition_point(|(term, _)| term.field() == field);
+        let field_terms = &self.term_positions[field_start..field_end];
+
+        let range_start = match range.0 {
+            Bound::Included(start) => field_terms.partition_point(|(term, _)| term < start),
+            Bound::Excluded(start) => field_terms.partition_point(|(term, _)| term <= start),
+            Bound::Unbounded => 0,
+        };
+        let range_end = match range.1 {
+            Bound::Included(end) => field_terms.partition_point(|(term, _)| term <= end),
+            Bound::Excluded(end) => field_terms.partition_point(|(term, _)| term < end),
+            Bound::Unbounded => field_terms.len(),
+        };
+        if range_start >= range_end {
+            return;
+        }
+
+        for (term, positions) in &field_terms[range_start..range_end] {
             if !visitor(
                 term,
                 SingleDocumentTermInfo {

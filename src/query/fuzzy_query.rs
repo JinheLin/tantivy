@@ -1,3 +1,5 @@
+use std::ops::Bound;
+
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA};
 use once_cell::sync::OnceCell;
 use tantivy_fst::Automaton;
@@ -223,7 +225,7 @@ impl SingleDocumentEvaluator for FuzzySingleDocumentEvaluator {
         document: &dyn SingleDocument,
     ) -> crate::Result<DocumentEvaluation> {
         let mut result = Ok(DocumentEvaluation::NoMatch);
-        document.visit_terms(self.field, &mut |term, term_info| {
+        let mut visitor = |term: &Term, term_info: crate::query::SingleDocumentTermInfo<'_>| {
             if matches!(result, Ok(DocumentEvaluation::Match(_)) | Err(_)) {
                 return false;
             }
@@ -242,7 +244,12 @@ impl SingleDocumentEvaluator for FuzzySingleDocumentEvaluator {
                 return false;
             }
             true
-        });
+        };
+        document.visit_terms(
+            self.field,
+            (Bound::Unbounded, Bound::Unbounded),
+            &mut visitor,
+        );
         result
     }
 
