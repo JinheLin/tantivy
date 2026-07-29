@@ -324,23 +324,14 @@ impl PhrasePrefixSingleDocumentEvaluator {
             let Some(term_info) = document.term_info(term) else {
                 return Ok(false);
             };
-            let positions = validated_positions(term, term_info)?;
-            let position_offset =
-                u32::try_from(self.fixed_position_target - offset).map_err(|_| {
-                    TantivyError::InvalidArgument(
-                        "PhrasePrefixQuery position offset exceeds u32::MAX".to_string(),
-                    )
-                })?;
             let adjusted = &mut self.adjusted_positions[term_index];
             adjusted.clear();
-            adjusted.reserve(positions.len());
-            for &position in positions {
-                adjusted.push(position.checked_add(position_offset).ok_or_else(|| {
-                    TantivyError::InvalidArgument(
-                        "PhrasePrefixQuery adjusted position exceeds u32::MAX".to_string(),
-                    )
-                })?);
-            }
+            validated_positions(
+                term,
+                term_info,
+                self.fixed_position_target - offset,
+                adjusted,
+            )?;
         }
         Ok(true)
     }
@@ -388,22 +379,14 @@ impl PhrasePrefixSingleDocumentEvaluator {
                 }
                 return true;
             }
-            let positions = match validated_positions(term, term_info) {
-                Ok(positions) => positions,
-                Err(current_error) => {
-                    error = Some(current_error);
-                    return false;
-                }
-            };
-            self.suffix_positions.reserve(positions.len());
-            for &position in positions {
-                let Some(adjusted) = position.checked_add(self.suffix_position_offset) else {
-                    error = Some(TantivyError::InvalidArgument(
-                        "PhrasePrefixQuery adjusted suffix position exceeds u32::MAX".to_string(),
-                    ));
-                    return false;
-                };
-                self.suffix_positions.push(adjusted);
+            if let Err(current_error) = validated_positions(
+                term,
+                term_info,
+                self.suffix_position_offset as usize,
+                &mut self.suffix_positions,
+            ) {
+                error = Some(current_error);
+                return false;
             }
             true
         };
@@ -493,10 +476,12 @@ impl SingleDocumentEvaluator for PhrasePrefixSingleDocumentEvaluator {
     }
 }
 
-fn validated_positions<'a>(
+fn validated_positions(
     term: &Term,
-    term_info: crate::query::SingleDocumentTermInfo<'a>,
-) -> crate::Result<&'a [u32]> {
+    term_info: crate::query::SingleDocumentTermInfo<'_>,
+    position_offset: usize,
+    output: &mut Vec<u32>,
+) -> crate::Result<()> {
     validate_term_info(term, term_info.term_freq)?;
     let positions = term_info.positions.ok_or_else(|| {
         TantivyError::InvalidArgument(format!(
@@ -515,5 +500,19 @@ fn validated_positions<'a>(
             "SingleDocument positions are not sorted for {term:?}"
         )));
     }
-    Ok(positions)
+    let position_offset = u32::try_from(position_offset).map_err(|_| {
+        TantivyError::InvalidArgument(format!(
+            "PhrasePrefixQuery position offset exceeds u32::MAX for {term:?}"
+        ))
+    })?;
+    if let Some(position) = positions.last() {
+        if position.checked_add(position_offset).is_none() {
+            return Err(TantivyError::InvalidArgument(format!(
+                "PhrasePrefixQuery adjusted position exceeds u32::MAX for {term:?}"
+            )));
+        }
+    }
+    output.reserve(positions.len());
+    output.extend(positions.iter().map(|position| position + position_offset));
+    Ok(())
 }
